@@ -1,15 +1,22 @@
 /**
  * 闸门要求的工具指纹补齐与响应侧名称回写。
  *
- * 免费车道的闸门校验请求体里声明的小写工具名集合必须齐备 `bash`、`glob`、`grep`、`read`
- * （实测：把工具数组整个去掉后，即使六个身份头齐备也返回 `403 FreeTierError`）。
+ * 2026-10 实测的闸门规则（取代 8 月的「四名字齐备」）：
  *
- * 补齐策略按 design D6：
+ * 1. 工具数组**必须包含一个名为 `read` 的工具**（canary：官方客户端永远携带它；
+ *    其余三个名字 `bash`/`glob`/`grep` 已不再必需，但保留补齐以贴近真实指纹）；
+ * 2. **每个工具的 `parameters.properties` 必须非空**——空 properties 的工具
+ *    （包括 canary 自己）会让整个请求 `403 FreeTierError`；
+ * 3. 工具名不限于官方集合（`task`/`todowrite` 等调用方自有名字可直传），
+ *    描述文案完全不敏感。
+ *
+ * 补齐策略沿用 design D6：
  * 1. 调用方已声明的要求名直接沿用；
  * 2. 只有大小写不同时**改写成小写**而不是重复声明（上游把重复名视为错误）；
  * 3. 缺失的槽位优先把能真正代答的调用方工具改名填入（Windows 上宿主把 shell 工具
  *    叫 `pwsh`，填入 `bash` 槽），这样模型真去调用时工具仍然可执行；
- * 4. 无可代答工具的槽位才补一个自禁用占位工具。
+ * 4. 无可代答工具的槽位才补一个自禁用占位工具——占位参数取自官方客户端的
+ *    真实定义（见 {@link PLACEHOLDER_PARAMETERS}），保证过闸。
  *
  * 响应侧按「发送拼写 → 调用方拼写」的映射把工具调用名还原，否则被改名的工具
  * （例如 `bash` 槽里的 `pwsh`）在宿主侧会找不到实现。
@@ -19,7 +26,7 @@
  * @module src/tools.js
  */
 
-/** 闸门要求的小写工具名集合，顺序即补齐顺序。 */
+/** 闸门要求的工具名集合，顺序即补齐顺序。`read` 是 canary，必须存在。 */
 export const REQUIRED_TOOL_NAMES = Object.freeze(['bash', 'glob', 'grep', 'read']);
 
 /**
@@ -31,7 +38,56 @@ const TOOL_DONORS = Object.freeze({ bash: Object.freeze(['pwsh']) });
 /** 占位工具的描述：明确告诉模型不要调用它。 */
 export const UNAVAILABLE_TOOL_DESCRIPTION = 'This tool is currently unavailable and must not be used.';
 
-/** 无 schema 的占位参数。 */
+/**
+ * 占位工具的参数 schema，逐字段取自官方客户端 2.0.24 真实请求里的同名工具定义
+ * （2026-10-15 从 `POST /zen/v1/chat/completions` 实捕获）。闸门要求每个工具的
+ * `parameters.properties` 非空，因此占位工具**不能**再发空 schema。
+ */
+const PLACEHOLDER_PARAMETERS = Object.freeze({
+  bash: Object.freeze({
+    type: 'object',
+    properties: Object.freeze({
+      command: Object.freeze({ type: 'string', description: 'Shell command string to execute' }),
+      workdir: Object.freeze({ type: 'string', description: 'Working directory to execute the command in' }),
+      timeout: Object.freeze({ type: 'integer', minimum: 0, description: 'Timeout in milliseconds' }),
+      background: Object.freeze({ type: 'boolean', description: 'Run the command in the background' }),
+    }),
+    required: Object.freeze(['command']),
+    additionalProperties: false,
+  }),
+  glob: Object.freeze({
+    type: 'object',
+    properties: Object.freeze({
+      pattern: Object.freeze({ type: 'string', description: 'Glob pattern to match files against' }),
+      path: Object.freeze({ type: 'string', description: 'Directory to search' }),
+      limit: Object.freeze({ type: 'integer', exclusiveMinimum: 0, description: 'Maximum number of matches' }),
+    }),
+    required: Object.freeze(['pattern']),
+    additionalProperties: false,
+  }),
+  grep: Object.freeze({
+    type: 'object',
+    properties: Object.freeze({
+      pattern: Object.freeze({ type: 'string', description: 'Regular expression to search for' }),
+      path: Object.freeze({ type: 'string', description: 'File or directory to search' }),
+      include: Object.freeze({ type: 'string', description: 'Glob filter for which files to search' }),
+    }),
+    required: Object.freeze(['pattern']),
+    additionalProperties: false,
+  }),
+  read: Object.freeze({
+    type: 'object',
+    properties: Object.freeze({
+      path: Object.freeze({ type: 'string', description: 'File or directory to read' }),
+      offset: Object.freeze({ type: 'integer', minimum: 0, description: 'The line to start reading from (1-based)' }),
+      limit: Object.freeze({ type: 'integer', minimum: 0, description: 'The maximum number of lines to read' }),
+    }),
+    required: Object.freeze(['path']),
+    additionalProperties: false,
+  }),
+});
+
+/** 空入参兜底：仅当调用方工具自身没有 parameters 时使用（正常调用方工具都有）。 */
 const EMPTY_PARAMETERS = Object.freeze({ type: 'object', properties: {} });
 
 /**
@@ -146,9 +202,10 @@ export function applyToolQuartet(tools, { style = 'chat', toolChoice = false } =
   for (const slot of REQUIRED_TOOL_NAMES) {
     if (seen.has(slot)) continue;
     added.push(slot);
+    const parameters = PLACEHOLDER_PARAMETERS[slot] ?? { ...EMPTY_PARAMETERS };
     out.push(style === 'responses'
-      ? { type: 'function', name: slot, description: UNAVAILABLE_TOOL_DESCRIPTION, parameters: { ...EMPTY_PARAMETERS } }
-      : { type: 'function', function: { name: slot, description: UNAVAILABLE_TOOL_DESCRIPTION, parameters: { ...EMPTY_PARAMETERS } } });
+      ? { type: 'function', name: slot, description: UNAVAILABLE_TOOL_DESCRIPTION, parameters }
+      : { type: 'function', function: { name: slot, description: UNAVAILABLE_TOOL_DESCRIPTION, parameters } });
   }
 
   const result = { tools: out, rename, added };

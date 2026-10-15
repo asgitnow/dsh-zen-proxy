@@ -20,7 +20,7 @@ import { mapUsage, parsePayload } from './chunks.js';
 import { classifyThrownError, classifyUpstreamFailure, readErrorEnvelope } from './failure.js';
 import { FAILURE_DISPOSITION, FAILURE_SCOPE } from './failure.js';
 import { PROBE_TIMEOUT_MS, requestUpstream } from './http.js';
-import { buildIdentityHeaders, probeRequest, probeSession, resolveClientVersion } from './identity.js';
+import { buildIdentityHeaders, deriveId, probeSession, resolveClientVersion } from './identity.js';
 import { buildRequestFor } from './messages.js';
 import { applyToolQuartet } from './tools.js';
 
@@ -105,8 +105,8 @@ export function isNormalIncrement(wire, json) {
  * 探测单个模型。
  *
  * 本函数不抛异常：一切都折算成判定结果，由调度与状态机决定如何处置。
- * @param {{modelId: string, round?: string, version?: string, signal?: AbortSignal,
- *          fetchImpl?: typeof fetch, timeoutMs?: number}} input
+ * @param {{modelId: string, round?: string, version?: string, apiKey?: string,
+ *          signal?: AbortSignal, fetchImpl?: typeof fetch, timeoutMs?: number}} input
  * @returns {Promise<{state: string, failure?: object, latencyMs: number, firstIncrementMs?: number,
  *                    usage?: object, detail?: string}>}
  */
@@ -114,15 +114,18 @@ export async function probeModel({
   modelId,
   round = 'round',
   version = resolveClientVersion().version,
+  apiKey,
   signal,
   fetchImpl,
   timeoutMs = PROBE_TIMEOUT_MS,
 }) {
   const started = Date.now();
+  // 每个模型探测一个新会话：时间戳真实即可过闸，且把探测配额摊到多个会话上；
+  // 请求 id 由同一会话派生，保持轮次内可关联。
   const session = probeSession();
-  const requestId = probeRequest(round, modelId);
+  const requestId = deriveId('msg_', `request\0${session}\0${round}\0${modelId}`);
   const { wire, path, body } = probeRequestFor(modelId);
-  const headers = buildIdentityHeaders({ version, session, requestId, stream: true });
+  const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey });
 
   try {
     const { payloads } = await requestUpstream({

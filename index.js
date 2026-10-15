@@ -1,9 +1,10 @@
 /**
  * dsh-zen-proxy — 把 OpenCode Zen 的免费模型车道接成 dsh 的原生 llm-provider 插件。
  *
- * 插件以官方 OpenCode 客户端的网络身份向上游发请求（免费车道的闸门只认
- * `user-agent: opencode/<>=1.18.0>` 与一组 `x-opencode-*` 头），每 10 分钟探测一次
- * 可用性，并把目录只交给「最近一次判定为可用」的免费模型；地区受限的免费模型进入
+ * 插件以官方 OpenCode 客户端的网络身份向上游发请求（2026-10 实测的闸门要求：
+ * 官方算法生成的 session id、工具数组里带 `read` 工具且每个工具 parameters 非空、
+ * 真实 API key——匿名 `Bearer public` 车道已关闭），每 10 分钟探测一次可用性，
+ * 并把目录只交给「最近一次判定为可用」的免费模型；地区受限的免费模型进入
  * 独立路由 `opencode-free-region`。
  *
  * 这里只做薄入口：`name` / `inject` / `Config` / `apply`。接线在 `src/register.js`，
@@ -36,12 +37,17 @@ export const Config = z.object({
    * 插件会记录诊断并回退到门槛值（闸门对更旧的版本返回 `426 UpgradeRequired`）。
    */
   opencodeVersion: z.string().default(DEFAULT_CLIENT_VERSION),
+  /**
+   * 免费车道凭据（闸门已拒绝匿名流量）。留空时按 `OPENCODE_API_KEY` 环境变量 →
+   * opencode 客户端的 `auth.json`（登录过 `opencode auth login` 即有）解析。
+   */
+  apiKey: z.string().default(''),
 });
 
 /**
  * 挂载插件。
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{probeIntervalMinutes: number, opencodeVersion: string}} config
+ * @param {{probeIntervalMinutes: number, opencodeVersion: string, apiKey?: string}} config
  */
 export function apply(ctx, config) {
   register(ctx, config, { pluginName: name });

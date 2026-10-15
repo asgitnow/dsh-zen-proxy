@@ -90,12 +90,13 @@ export function conversationIdentity(options) {
 
 /**
  * 创建一个适配器实例。
- * @param {{state: () => object, clientVersion?: string, fetchImpl?: typeof fetch,
+ * @param {{state: () => object, clientVersion?: string, apiKey?: string, fetchImpl?: typeof fetch,
  *          timeoutMs?: number}} deps
- *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）
+ *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）；
+ *   `apiKey` 是已解析的免费车道凭据（见 `src/credentials.js`）
  * @returns {object} 六点齐全的适配器
  */
-export function createAdapter({ state, clientVersion, fetchImpl, timeoutMs }) {
+export function createAdapter({ state, clientVersion, apiKey, fetchImpl, timeoutMs }) {
   const version = clientVersion ?? resolveClientVersion().version;
 
   function modelEntry(provider, modelId) {
@@ -177,7 +178,7 @@ export function createAdapter({ state, clientVersion, fetchImpl, timeoutMs }) {
       const resolved = this.resolveModel(provider, model);
       return {
         model: resolved,
-        stream: (options) => streamTurn(options, { version, fetchImpl, timeoutMs }),
+        stream: (options) => streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }),
       };
     },
   };
@@ -189,10 +190,10 @@ export function createAdapter({ state, clientVersion, fetchImpl, timeoutMs }) {
  * 失败以「抛出带 `code` 与 `failure` 自有属性的 Error」交付；宿主会把它转成终止失败
  * 分片。取消则本流自己产出一个 `{kind:'aborted'}` 的终止 `finish`。
  * @param {object} options 宿主的 `GenerateOptions`
- * @param {{version: string, fetchImpl?: typeof fetch, timeoutMs?: number}} context
+ * @param {{version: string, apiKey?: string, fetchImpl?: typeof fetch, timeoutMs?: number}} context
  * @returns {AsyncGenerator<object>}
  */
-async function* streamTurn(options, { version, fetchImpl, timeoutMs }) {
+async function* streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }) {
   const modelId = String(options?.model ?? '');
   const signal = options?.signal;
   if (signal?.aborted === true) {
@@ -220,7 +221,7 @@ async function* streamTurn(options, { version, fetchImpl, timeoutMs }) {
     temperature: options?.temperature,
     stop: options?.stop,
   });
-  const headers = buildIdentityHeaders({ version, session, requestId, stream: true });
+  const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey });
 
   const { payloads } = await requestUpstream({
     path: pathForModel(modelId),

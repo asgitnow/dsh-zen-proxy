@@ -324,7 +324,8 @@ describe('入口 index.js', () => {
     assert.equal(typeof entry.apply, 'function');
     const parsed = entry.Config({});
     assert.equal(parsed.probeIntervalMinutes, 10);
-    assert.equal(parsed.opencodeVersion, '1.18.31');
+    assert.equal(parsed.opencodeVersion, '2.0.24');
+    assert.equal(parsed.apiKey, '');
   });
 });
 

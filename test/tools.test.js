@@ -61,6 +61,26 @@ describe('applyToolQuartet', () => {
     assert.deepEqual(promoted.function.parameters, { type: 'object', properties: {} });
   });
 
+  it('占位工具的 parameters.properties 非空（闸门拒绝空 schema）', () => {
+    const { tools } = applyToolQuartet([]);
+    for (const tool of tools) {
+      const parameters = tool.function.parameters;
+      assert.equal(parameters.type, 'object');
+      assert.ok(Object.keys(parameters.properties ?? {}).length > 0,
+        `${tool.function.name} 的 properties 不能为空`);
+    }
+    // canary 工具 read 必须存在
+    assert.ok(declaredNames(tools).includes('read'));
+  });
+
+  it('占位工具的参数 schema 取自官方真实定义', () => {
+    const { tools } = applyToolQuartet([], { style: 'responses' });
+    const read = tools.find((tool) => tool.name === 'read');
+    assert.deepEqual(Object.keys(read.parameters.properties).sort(), ['limit', 'offset', 'path']);
+    const bash = tools.find((tool) => tool.name === 'bash');
+    assert.deepEqual(Object.keys(bash.parameters.properties).sort(), ['background', 'command', 'timeout', 'workdir']);
+  });
+
   it('调用方没有任何工具时把 tool_choice 置为 none', () => {
     const { toolChoice, tools } = applyToolQuartet([], { toolChoice: true });
     assert.equal(toolChoice, 'none');
@@ -78,7 +98,7 @@ describe('applyToolQuartet', () => {
       assert.equal(tool.type, 'function');
       assert.equal(typeof tool.name, 'string');
       assert.equal(tool.function, undefined);
-      assert.deepEqual(tool.parameters, { type: 'object', properties: {} });
+      assert.ok(Object.keys(tool.parameters?.properties ?? {}).length > 0);
     }
   });
 

@@ -4,8 +4,22 @@
 把 **OpenCode Zen 的免费模型车道**接成 dsh 的**原生 llm-provider**。
 
 装上即可在桌面端的模型选择器里直接使用 Zen 的免费模型，**不需要监听端口、不需要写
-`settings.yaml`、不需要 API Key**。插件以官方 OpenCode 客户端的网络身份向上游发请求，
-每 10 分钟探测一次可用性，并且**只把「判定为可用」的免费模型放进目录**。
+`settings.yaml`**。插件以官方 OpenCode 客户端的网络身份向上游发请求，每 10 分钟探测一次
+可用性，并且**只把「判定为可用」的免费模型放进目录**。
+
+> **2026-10 闸门收紧（本仓库已适配，见下）。** 上游免费车道关闭了匿名访问并升级了身份
+> 校验，8 月版的六头伪装已全部失效（`403 FreeTierError`，模型目录恒为空）。现在的要求：
+>
+> 1. **必须携带真实 API key**——`Bearer public` 匿名车道已关闭。插件按
+>    配置 `apiKey` → 环境变量 `OPENCODE_API_KEY` → opencode 客户端的
+>    `~/.local/share/opencode/auth.json`（登录过 `opencode auth login` 即有）解析；
+>    三处都没有时探测失败并在日志里给出明确指引。
+> 2. **session id 必须按官方算法生成**（时间戳 + 随机后缀，出现在四个 session 头里），
+>    sha256 派生的会话 id 一律被拒。
+> 3. **工具数组必须包含名为 `read` 的工具，且每个工具 `parameters.properties` 非空**
+>    （旧的四名字齐备要求已被取代；占位工具已改用官方真实参数 schema）。
+> 4. **禁止携带 `x-opencode-request` 头**（真实客户端不发它，带上即被拒）。
+>
 
 > **这次改造是破坏性变更。** 旧版本是一个本地 HTTP 代理（监听 `127.0.0.1:4097`，要求用户
 > 把 provider 的 `baseURL` 指向它）。代理面、`host`/`port`/`upstream*`/`userAgent` 等配置项
@@ -97,12 +111,13 @@ profile 的 `node_modules` 里，因此它们只作为本包的 `peerDependencie
 
 ## 配置
 
-插件有两个配置项（探测周期，以及受门槛约束的伪装版本号）：
+插件有三个配置项（探测周期、伪装版本号、凭据）：
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `probeIntervalMinutes` | `10` | 探测周期（分钟）。运行中修改后，**下一轮**起生效，无需重启进程。 |
-| `opencodeVersion` | `1.18.31` | 伪装用的 OpenCode 版本。低于闸门门槛 `1.18.0` 的值不会被使用，插件会记录一条诊断并回退到门槛值。 |
+| `opencodeVersion` | `2.0.24` | 伪装用的 OpenCode 版本（拼进四段式 UA）。低于 `1.18.0` 的值不会被使用，插件会记录一条诊断并回退到门槛值。当前闸门不校验 UA。 |
+| `apiKey` | `''`（空） | 免费车道凭据。留空时按 `OPENCODE_API_KEY` 环境变量 → opencode 客户端的 `auth.json` 解析；三处都为空时探测失败并记录诊断。 |
 
 ---
 

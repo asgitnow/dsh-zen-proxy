@@ -266,7 +266,7 @@ describe('prepareCall / stream', () => {
 
   it('发出的请求带齐身份头、四连工具、tool_choice 与原始对话', async () => {
     const { fetch, calls } = fakeFetch(() => sseResponse([chatFrame({ content: 'hi' }), chatFinishFrame('stop')]));
-    const adapter = createAdapter({ state: mixedState, fetchImpl: fetch });
+    const adapter = createAdapter({ state: mixedState, apiKey: 'sk-test', fetchImpl: fetch });
     const prepared = await adapter.prepareCall(ROUTE_MAIN, 'fledge-alpha-free');
     await collect(prepared.stream(options));
 
@@ -278,8 +278,16 @@ describe('prepareCall / stream', () => {
     assert.equal(body.max_tokens, 16384, '未指定档位时按默认（均衡）档发出预算');
     for (const field of EFFORT_FIELDS) assert.equal(field in body, false, `不应发送 ${field}`);
     const headers = calls[0].init.headers;
-    assert.match(headers['user-agent'], /^opencode\/1\.18\./);
-    assert.equal(headers.authorization, 'Bearer public');
+    assert.match(headers['user-agent'], /^opencode\/latest\//);
+    assert.equal(headers.authorization, 'Bearer sk-test');
+  });
+
+  it('没有凭据时退化为匿名凭据', async () => {
+    const { fetch, calls } = fakeFetch(() => sseResponse([chatFrame({ content: 'hi' }), chatFinishFrame('stop')]));
+    const adapter = createAdapter({ state: mixedState, fetchImpl: fetch });
+    const prepared = await adapter.prepareCall(ROUTE_MAIN, 'fledge-alpha-free');
+    await collect(prepared.stream(options));
+    assert.equal(calls[0].init.headers.authorization, 'Bearer public');
   });
 
   it('调用方指定的上限收窄档位预算', async () => {

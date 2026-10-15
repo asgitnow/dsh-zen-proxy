@@ -57,11 +57,11 @@ describe('probeModel', () => {
     assert.ok(result.firstIncrementMs >= 0);
 
     const headers = calls[0].init.headers;
-    for (const name of ['user-agent', 'authorization', 'x-opencode-client', 'x-opencode-project', 'x-opencode-session', 'x-opencode-request']) {
+    for (const name of ['user-agent', 'authorization', 'x-opencode-client', 'x-opencode-project', 'x-opencode-session']) {
       assert.ok(typeof headers[name] === 'string' && headers[name] !== '', `缺少 ${name}`);
     }
     assert.match(headers['x-opencode-session'], /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-    assert.match(headers['x-opencode-request'], /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+    assert.equal(headers['x-opencode-request'], undefined, '不得携带 x-opencode-request');
     assert.match(calls[0].url, /^https:\/\/opencode\.ai\/zen\/v1\/chat\/completions$/);
     assert.equal(JSON.parse(calls[0].init.body).model, 'fledge-alpha-free');
   });
@@ -132,15 +132,15 @@ describe('probeModel', () => {
     assert.notEqual(result.state, PROBE_STATE.available);
   });
 
-  it('探测会话与用户对话隔离，且请求 id 绑定轮次与模型', async () => {
+  it('每个模型探测用独立的新会话', async () => {
     const { fetch, calls } = fakeFetch(() => sseResponse(OK_FRAMES));
     await probeModel({ modelId: 'fledge-alpha-free', round: 'round-1', fetchImpl: fetch });
     await probeModel({ modelId: 'exo-free', round: 'round-1', fetchImpl: fetch });
     await probeModel({ modelId: 'exo-free', round: 'round-2', fetchImpl: fetch });
     const [first, second, third] = calls.map((call) => call.init.headers);
-    assert.equal(first['x-opencode-session'], second['x-opencode-session']);
-    assert.notEqual(first['x-opencode-request'], second['x-opencode-request']);
-    assert.notEqual(second['x-opencode-request'], third['x-opencode-request']);
+    // 会话彼此独立（隔离对话流量，也把探测配额摊开）
+    assert.notEqual(first['x-opencode-session'], second['x-opencode-session']);
+    assert.notEqual(second['x-opencode-session'], third['x-opencode-session']);
   });
 
   it('探测不抛异常', async () => {
