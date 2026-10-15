@@ -36,7 +36,7 @@ export default {
       );
     }
     const got = request.headers.get('x-zen-relay-token') ?? url.searchParams.get('token') ?? '';
-    if (!tokensEqual(got, expected)) {
+    if (!(await tokensEqual(got, expected))) {
       return json({ error: { type: 'api_error', message: 'relay: token mismatch' } }, 403);
     }
 

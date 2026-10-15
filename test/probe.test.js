@@ -28,13 +28,14 @@ describe('isNormalIncrement', () => {
 });
 
 describe('probeRequestFor', () => {
-  it('chat 族发到 chat 端点并把四连工具与 tool_choice:none 一起带上', () => {
+  it('chat 族发到 chat 端点并把四连工具带上，且不发送 tool_choice', () => {
     const { wire, path, body } = probeRequestFor('fledge-alpha-free');
     assert.equal(wire, 'chat');
     assert.equal(path, '/chat/completions');
     assert.equal(body.stream, true);
     assert.deepEqual(body.tools.map((tool) => tool.function.name).sort(), ['bash', 'glob', 'grep', 'read']);
-    assert.equal(body.tool_choice, 'none');
+    // 上游只接受 "auto"，其余取值（含 "none"）会被拒 → 干脆不发
+    assert.equal('tool_choice' in body, false);
     assert.equal(body.max_tokens, 16);
   });
 
@@ -45,6 +46,7 @@ describe('probeRequestFor', () => {
     assert.equal(body.store, false);
     assert.deepEqual(body.tools.map((tool) => tool.name).sort(), ['bash', 'glob', 'grep', 'read']);
     assert.equal(body.tools[0].function, undefined);
+    assert.equal('tool_choice' in body, false);
     assert.equal(body.max_output_tokens, 16);
   });
 });

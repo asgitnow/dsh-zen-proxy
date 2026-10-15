@@ -65,14 +65,17 @@ export function verdictFor(classification) {
 
 /**
  * 构造一次探测请求（协议族、路径与请求体）。
+ *
+ * `tool_choice` 必须留空（不发送）：上游只接受 `"auto"`，`"none"` / `"required"` /
+ * 指定函数都会被拒（实测 400 `only "auto" is supported for tool_choice`，2026-10-15
+ * 在 muse-spark 系上暴露）。探测只需要「模型会开口」，用 `"auto"` 与不发送等价。
  * @param {string} modelId
  * @returns {{wire: 'chat'|'responses', path: string, body: object}}
  */
 export function probeRequestFor(modelId) {
   const wire = wireFor(modelId);
-  // 调用方（本模块）没有声明任何工具，因此补上闸门要求的四连、并把 tool_choice
-  // 置为 none，避免模型去调用自禁用占位工具。
-  const { tools, toolChoice } = applyToolQuartet([], { style: wire, toolChoice: true });
+  // 调用方（本模块）没有声明任何工具，因此补上闸门要求的四连。
+  const { tools } = applyToolQuartet([], { style: wire, toolChoice: false });
   return {
     wire,
     path: pathForModel(modelId),
@@ -80,7 +83,6 @@ export function probeRequestFor(modelId) {
       model: modelId,
       messages: [{ role: 'user', content: [{ type: 'text', text: 'ping' }] }],
       tools,
-      toolChoice,
       maxTokens: PROBE_MAX_TOKENS,
     }),
   };
