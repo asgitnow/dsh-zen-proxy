@@ -1,0 +1,5 @@
+# 部署侧只放名字与入口；令牌必须用 secret（`wrangler secret put RELAY_TOKEN`），
+# 不要写进本文件提交到仓库。
+name = "zen-region-relay"
+main = "relay.js"
+compatibility_date = "2026-10-01"

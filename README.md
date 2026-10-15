@@ -168,6 +168,25 @@ HTTP 状态码 403，无论走 `/chat/completions` 还是 `/responses`、无论�
 > 「地区受限」只能在车道不处于限流时观察到；插件靠上面说的「瞬时故障宽限」保留此前
 > 的地区归属，不会被一次 429 抹掉。
 
+### 区域中继（可选）：让地区受限模型恢复可用
+
+区域判据是**出口 IP 的国家**，而 Cloudflare Worker 的出站请求从 CF 边缘机房发出
+（非受限地区 IP），因此一个带令牌鉴权的转发 Worker 可以让这些模型恢复可用。
+配套脚本与部署步骤见 [`worker/README.md`](worker/README.md)；部署后给插件加两个
+配置项即可启用：
+
+```yaml
+- id: zen-proxy
+  config:
+    regionRelayUrl: https://zen-region-relay.<你的子域>.workers.dev
+    regionRelayToken: <与 Worker 的 RELAY_TOKEN secret 相同>
+```
+
+生效后的行为：每轮探测里，此前判定为「地区受限」的模型改经中继探测；判定可用即进入
+主分组 `opencode-free`（状态记 `via: "relay"`），对话请求同走中继。中继探测仍返回
+`RegionError` 则留在地区分组；中继故障按瞬时故障处理（有宽限），不会清空目录；
+卸载两个字段即回退直连。未配置中继时行为与本节其余描述完全一致。
+
 ---
 
 ## 思考强度

@@ -134,7 +134,8 @@ async function readErrorPayload(response) {
  *
  * @param {{path: string, method?: 'GET'|'POST', headers: Record<string,string>, body?: object,
  *          signal?: AbortSignal, fetchImpl?: typeof fetch, timeoutMs?: number, requestId?: string,
- *          stream?: boolean}} input
+ *          stream?: boolean, baseUrl?: string}} input
+ *   `baseUrl` 覆盖默认上游地址（区域中继用）；不要带尾斜杠。
  * @returns {Promise<{status: number, payloads?: AsyncGenerator<string>, json?: unknown}>}
  */
 export async function requestUpstream({
@@ -147,11 +148,12 @@ export async function requestUpstream({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   requestId,
   stream = true,
+  baseUrl,
 }) {
   const scope = createRequestScope(signal, timeoutMs);
   let response;
   try {
-    response = await fetchImpl(`${UPSTREAM_BASE_URL}${path}`, {
+    response = await fetchImpl(`${baseUrl ?? UPSTREAM_BASE_URL}${path}`, {
       method,
       headers,
       ...body === undefined ? {} : { body: JSON.stringify(body) },

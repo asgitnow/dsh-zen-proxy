@@ -42,12 +42,20 @@ export const Config = z.object({
    * opencode 客户端的 `auth.json`（登录过 `opencode auth login` 即有）解析。
    */
   apiKey: z.string().default(''),
+  /**
+   * 区域中继地址（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md）。
+   * 配置后，判定为地区受限的模型改经它探测与对话；中继探测可用即进主目录。
+   */
+  regionRelayUrl: z.string().default(''),
+  /** 区域中继的访问令牌，须与 Worker 部署时的 `RELAY_TOKEN` secret 一致。 */
+  regionRelayToken: z.string().default(''),
 });
 
 /**
  * 挂载插件。
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{probeIntervalMinutes: number, opencodeVersion: string, apiKey?: string}} config
+ * @param {{probeIntervalMinutes: number, opencodeVersion: string, apiKey?: string,
+ *          regionRelayUrl?: string, regionRelayToken?: string}} config
  */
 export function apply(ctx, config) {
   register(ctx, config, { pluginName: name });

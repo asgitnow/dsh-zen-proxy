@@ -106,7 +106,9 @@ export function isNormalIncrement(wire, json) {
  *
  * 本函数不抛异常：一切都折算成判定结果，由调度与状态机决定如何处置。
  * @param {{modelId: string, round?: string, version?: string, apiKey?: string,
+ *          baseUrl?: string, extraHeaders?: Record<string, string>,
  *          signal?: AbortSignal, fetchImpl?: typeof fetch, timeoutMs?: number}} input
+ *   `baseUrl` 覆盖上游地址（区域中继探测用）；`extraHeaders` 附加头（中继令牌）。
  * @returns {Promise<{state: string, failure?: object, latencyMs: number, firstIncrementMs?: number,
  *                    usage?: object, detail?: string}>}
  */
@@ -115,6 +117,8 @@ export async function probeModel({
   round = 'round',
   version = resolveClientVersion().version,
   apiKey,
+  baseUrl,
+  extraHeaders,
   signal,
   fetchImpl,
   timeoutMs = PROBE_TIMEOUT_MS,
@@ -126,6 +130,7 @@ export async function probeModel({
   const requestId = deriveId('msg_', `request\0${session}\0${round}\0${modelId}`);
   const { wire, path, body } = probeRequestFor(modelId);
   const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey });
+  if (extraHeaders !== undefined) Object.assign(headers, extraHeaders);
 
   try {
     const { payloads } = await requestUpstream({
@@ -136,6 +141,7 @@ export async function probeModel({
       fetchImpl,
       timeoutMs,
       requestId,
+      baseUrl,
     });
 
     let frames = 0;

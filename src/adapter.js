@@ -31,7 +31,7 @@ import { buildIdentityHeaders, requestForTurn, resolveClientVersion, sessionForC
 import { buildRequestFor } from './messages.js';
 import { translateChatStream } from './chat.js';
 import { translateResponsesStream } from './responses.js';
-import { MODEL_STATE, modelsWithVerdict } from './state.js';
+import { MODEL_STATE, modelsWithVerdict, viaOf } from './state.js';
 import { applyToolQuartet } from './tools.js';
 
 /** 主路由：判定为可用的免费模型。 */
@@ -90,13 +90,15 @@ export function conversationIdentity(options) {
 
 /**
  * 创建一个适配器实例。
- * @param {{state: () => object, clientVersion?: string, apiKey?: string, fetchImpl?: typeof fetch,
+ * @param {{state: () => object, clientVersion?: string, apiKey?: string,
+ *          regionRelay?: {url: string, token: string}, fetchImpl?: typeof fetch,
  *          timeoutMs?: number}} deps
  *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）；
- *   `apiKey` 是已解析的免费车道凭据（见 `src/credentials.js`）
+ *   `apiKey` 是已解析的免费车道凭据（见 `src/credentials.js`）；
+ *   `regionRelay` 是区域中继（可选）：判定路径为 `relay` 的模型经它收发。
  * @returns {object} 六点齐全的适配器
  */
-export function createAdapter({ state, clientVersion, apiKey, fetchImpl, timeoutMs }) {
+export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetchImpl, timeoutMs }) {
   const version = clientVersion ?? resolveClientVersion().version;
 
   function modelEntry(provider, modelId) {
@@ -178,7 +180,7 @@ export function createAdapter({ state, clientVersion, apiKey, fetchImpl, timeout
       const resolved = this.resolveModel(provider, model);
       return {
         model: resolved,
-        stream: (options) => streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }),
+        stream: (options) => streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs }),
       };
     },
   };
@@ -190,10 +192,11 @@ export function createAdapter({ state, clientVersion, apiKey, fetchImpl, timeout
  * 失败以「抛出带 `code` 与 `failure` 自有属性的 Error」交付；宿主会把它转成终止失败
  * 分片。取消则本流自己产出一个 `{kind:'aborted'}` 的终止 `finish`。
  * @param {object} options 宿主的 `GenerateOptions`
- * @param {{version: string, apiKey?: string, fetchImpl?: typeof fetch, timeoutMs?: number}} context
+ * @param {{version: string, apiKey?: string, regionRelay?: {url: string, token: string},
+ *          state: () => object, fetchImpl?: typeof fetch, timeoutMs?: number}} context
  * @returns {AsyncGenerator<object>}
  */
-async function* streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }) {
+async function* streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs }) {
   const modelId = String(options?.model ?? '');
   const signal = options?.signal;
   if (signal?.aborted === true) {
@@ -222,6 +225,11 @@ async function* streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }) {
     stop: options?.stop,
   });
   const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey });
+  // 判定路径为 relay 的模型（区域受限、经中继恢复可用）经同一中继收发。
+  const viaRelay = regionRelay !== undefined && viaOf(state(), modelId) === 'relay';
+  if (viaRelay) {
+    headers['x-zen-relay-token'] = regionRelay.token;
+  }
 
   const { payloads } = await requestUpstream({
     path: pathForModel(modelId),
@@ -231,6 +239,7 @@ async function* streamTurn(options, { version, apiKey, fetchImpl, timeoutMs }) {
     fetchImpl,
     timeoutMs,
     requestId,
+    ...(viaRelay ? { baseUrl: regionRelay.url } : {}),
   });
 
   const translate = wire === 'responses' ? translateResponsesStream : translateChatStream;

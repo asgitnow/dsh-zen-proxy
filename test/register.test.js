@@ -9,7 +9,7 @@ import { after, describe, it } from 'node:test';
 
 import { ROUTE_MAIN, ROUTE_REGION } from '../src/adapter.js';
 import { register } from '../src/register.js';
-import { chatFinishFrame, chatFrame, fakeFetch, fakeLogger, jsonResponse, sseResponse } from './fake-upstream.js';
+import { chatFinishFrame, chatFrame, collect, fakeFetch, fakeLogger, jsonResponse, sseResponse } from './fake-upstream.js';
 
 const tempDirs = [];
 function tempDir() {
@@ -313,6 +313,97 @@ describe('一轮探测驱动目录', () => {
       ['fledge-alpha-free'],
     );
     second.disposers.find((entry) => entry.label.includes('probe')).disposer();
+  });
+});
+
+describe('区域中继', () => {
+  it('配置中继后，地区受限模型经中继探测恢复进主目录，并携带中继令牌', async () => {
+    const stateFile = join(tempDir(), 'relay-state.json');
+    // 第一轮（无中继）：muse-spark 判定为地区受限
+    const firstCtx = fakeContext();
+    const first = upstreamStub({
+      listing: ['muse-spark-1.3-contributor-free'],
+      framesByModel: { 'muse-spark-1.3-contributor-free': [REGION_FRAME] },
+    });
+    const handle = register(firstCtx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: first.fetch });
+    await handle.runRound();
+    firstCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    assert.deepEqual(
+      (await firstCtx.adapterCalls[0].adapter.listModels(ROUTE_REGION)).map((model) => model.id),
+      ['muse-spark-1.3-contributor-free'],
+    );
+
+    // 第二轮（配置中继）：中继侧给正常流 → 模型恢复进主目录，对话请求同走中继。
+    // muse-spark 走 responses 协议族，探测与对话都按 responses 事件返回。
+    const relayCalls = [];
+    const okResponses = () => sseResponse([
+      JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' }),
+      JSON.stringify({ type: 'response.completed' }),
+    ]);
+    const second = fakeFetch((url, init) => {
+      if (url.includes('relay.example')) {
+        relayCalls.push({ url, token: init.headers['x-zen-relay-token'] });
+        return okResponses();
+      }
+      if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: [{ id: 'muse-spark-1.3-contributor-free' }] });
+      return okResponses();
+    });
+    const secondCtx = fakeContext();
+    const secondHandle = register(secondCtx, {
+      probeIntervalMinutes: 10,
+      regionRelayUrl: 'https://relay.example',
+      regionRelayToken: 'tok-1',
+    }, { stateFile, fetchImpl: second.fetch });
+    await secondHandle.runRound();
+    secondCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+
+    // 调度器挂载即自动跑首轮，加上手动 runRound：中继探测可能发生多次，
+    // 只断言每一次的形状（地址与令牌）都正确。muse-spark 系走 responses 协议族。
+    assert.ok(relayCalls.length >= 1, '地区受限模型应经中继探测');
+    for (const call of relayCalls) {
+      assert.match(call.url, /^https:\/\/relay\.example\/(?:chat\/completions|responses)$/);
+      assert.equal(call.token, 'tok-1');
+    }
+    const adapter = secondCtx.adapterCalls[0].adapter;
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['muse-spark-1.3-contributor-free']);
+    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), []);
+
+    // 中继模型的真实对话请求也走中继（via: relay），并带同一令牌
+    const prepared = await adapter.prepareCall(ROUTE_MAIN, 'muse-spark-1.3-contributor-free');
+    await collect(prepared.stream({ sessionId: 'ses-x', messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: '你好' }] }] }));
+    const last = relayCalls.at(-1);
+    assert.match(last.url, /^https:\/\/relay\.example\/(?:chat\/completions|responses)$/, '对话请求也应命中中继');
+    assert.equal(last.token, 'tok-1');
+  });
+
+  it('中继探测仍返回 RegionError 时模型留在地区分组', async () => {
+    const stateFile = join(tempDir(), 'relay-state2.json');
+    const firstCtx = fakeContext();
+    const first = upstreamStub({
+      listing: ['muse-spark-1.3-contributor-free'],
+      framesByModel: { 'muse-spark-1.3-contributor-free': [REGION_FRAME] },
+    });
+    const handle = register(firstCtx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: first.fetch });
+    await handle.runRound();
+    firstCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+
+    const secondCtx = fakeContext();
+    const second = fakeFetch((url) => {
+      if (url.includes('relay.example')) return sseResponse([REGION_FRAME]);
+      if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: [{ id: 'muse-spark-1.3-contributor-free' }] });
+      return sseResponse([REGION_FRAME]);
+    });
+    const secondHandle = register(secondCtx, {
+      probeIntervalMinutes: 10,
+      regionRelayUrl: 'https://relay.example',
+      regionRelayToken: 'tok-1',
+    }, { stateFile, fetchImpl: second.fetch });
+    await secondHandle.runRound();
+    secondCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+
+    const adapter = secondCtx.adapterCalls[0].adapter;
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), []);
+    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), ['muse-spark-1.3-contributor-free']);
   });
 });
 

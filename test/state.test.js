@@ -127,6 +127,30 @@ describe('reduceRound', () => {
     assert.equal(verdictOf(state, 'keep-free'), MODEL_STATE.available);
     assert.equal(verdictOf(state, 'new-free'), MODEL_STATE.unknown);
   });
+
+  it('中继探测的可用判定记 via: relay，直连探测会把它抹掉', () => {
+    const relayed = reduceRound(emptyState(), {
+      models: ['r-free', 'd-free'],
+      results: {
+        'r-free': { state: PROBE_STATE.available, via: 'relay' },
+        'd-free': { state: PROBE_STATE.available },
+      },
+      now: 1,
+    });
+    assert.equal(relayed.state.models['r-free'].via, 'relay');
+    assert.equal(relayed.state.models['d-free'].via, undefined);
+    assert.deepEqual(modelsWithVerdict(relayed.state, MODEL_STATE.available), ['r-free', 'd-free'],
+      '经中继恢复的模型与直连模型同住主目录');
+
+    // 中继撤掉后改直连探测：via 应被清除
+    const backToDirect = reduceRound(relayed.state, {
+      models: ['r-free'],
+      results: { 'r-free': { state: PROBE_STATE.region } },
+      now: 2,
+    });
+    assert.equal(backToDirect.state.models['r-free'].via, undefined);
+    assert.equal(verdictOf(backToDirect.state, 'r-free'), MODEL_STATE.region);
+  });
 });
 
 describe('持久化', () => {

@@ -107,6 +107,7 @@ function normalizeState(value) {
         : 0,
       ...Number.isFinite(entry.checkedAt) ? { checkedAt: entry.checkedAt } : {},
       ...typeof entry.detail === 'string' && entry.detail !== '' ? { detail: entry.detail } : {},
+      ...entry.via === 'relay' ? { via: 'relay' } : {},
     };
   }
   return {
@@ -227,6 +228,8 @@ export function reduceRound(previous, { models = [], results = {}, now = Date.no
       transientStreak: 0,
       checkedAt: now,
       ...result.detail === undefined ? {} : { detail: result.detail },
+      // 判定路径：`relay` 表示该判定经区域中继取得（对话请求也要走中继）。
+      ...result.via === 'relay' ? { via: 'relay' } : {},
     };
   }
 
@@ -262,4 +265,15 @@ export function modelsWithVerdict(state, verdict) {
  */
 export function verdictOf(state, modelId) {
   return state?.models?.[modelId]?.state ?? MODEL_STATE.unknown;
+}
+
+/**
+ * 某个模型的判定路径：`'relay'` 表示最近一次「可用」判定经区域中继取得，
+ * 对话请求也应走同一条中继；其余模型直连。
+ * @param {object} state
+ * @param {string} modelId
+ * @returns {'relay' | undefined}
+ */
+export function viaOf(state, modelId) {
+  return state?.models?.[modelId]?.via === 'relay' ? 'relay' : undefined;
 }

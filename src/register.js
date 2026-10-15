@@ -32,6 +32,7 @@ import {
 import { PROBE_STATE, probeModels } from './probe.js';
 import { createScheduler } from './schedule.js';
 import {
+  MODEL_STATE,
   loadState,
   modelsWithVerdict,
   reduceRound,
@@ -86,12 +87,24 @@ export function register(ctx, config, options = {}) {
       + '缺失期间探测会以 403 FreeTierError 失败，模型目录保持为空。');
   }
 
+  // 区域中继（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md），
+  // 让地区受限模型（RegionError）恢复可用。URL 不带尾斜杠；令牌经
+  // `x-zen-relay-token` 头交给 Worker 校验。
+  const relayUrl = typeof config?.regionRelayUrl === 'string' ? config.regionRelayUrl.trim().replace(/\/+$/, '') : '';
+  const relayToken = typeof config?.regionRelayToken === 'string' ? config.regionRelayToken.trim() : '';
+  const regionRelay = relayUrl !== '' ? { url: relayUrl, token: relayToken } : undefined;
+  if (regionRelay !== undefined && relayToken === '') {
+    logger.warn?.('zen-proxy: 已配置 regionRelayUrl 但 regionRelayToken 为空；'
+      + 'Worker 开启了令牌校验时这些请求会被拒（403）。');
+  }
+  const relayProbeHeaders = relayToken !== '' ? { 'x-zen-relay-token': relayToken } : undefined;
+
   // 状态目录由宿主环境解析（DSH_HOME → 宿主配置根），不写死任何用户目录路径。
   // 显式传入的 stateFile 覆盖用给测试，生产路径始终来自环境解析。
   const stateFile = options.stateFile ?? resolveStateFile({ env: process.env });
   let state = loadState(stateFile);
 
-  const adapter = createAdapter({ state: () => state, clientVersion: version, apiKey, fetchImpl });
+  const adapter = createAdapter({ state: () => state, clientVersion: version, apiKey, regionRelay, fetchImpl });
   adoptHostBaseClass(adapter);
 
   const controller = new AbortController();
@@ -136,13 +149,35 @@ export function register(ctx, config, options = {}) {
         + `将省略 context 字段（不影响它们在目录中的呈现）：${withoutMetadata.join(', ')}`);
     }
 
+    // 探测分组：直连为主；已判定「地区受限」的模型在配置了中继时改走中继探测，
+    // 中继探测判定可用即恢复进主目录（状态记 via: 'relay'，对话请求同路）。
+    const relaySet = regionRelay !== undefined
+      ? new Set(modelsWithVerdict(state, MODEL_STATE.region).filter((id) => candidates.includes(id)))
+      : new Set();
+    const directSet = candidates.filter((id) => !relaySet.has(id));
+
     const results = await probeModels(
-      candidates,
+      directSet,
       { round, version, apiKey, signal: controller.signal, fetchImpl, timeoutMs: PROBE_TIMEOUT_MS },
       (modelId, result) => {
         logger.info?.(`zen-proxy: 探测 ${modelId} → ${result.state}`);
       },
     );
+    if (relaySet.size > 0) {
+      const relayResults = await probeModels(
+        [...relaySet],
+        {
+          round, version, apiKey, baseUrl: regionRelay.url, extraHeaders: relayProbeHeaders,
+          signal: controller.signal, fetchImpl, timeoutMs: PROBE_TIMEOUT_MS,
+        },
+        (modelId, result) => {
+          logger.info?.(`zen-proxy: 探测 ${modelId}（经区域中继）→ ${result.state}`);
+        },
+      );
+      for (const [id, result] of Object.entries(relayResults)) {
+        results[id] = { ...result, via: 'relay' };
+      }
+    }
 
     if (controller.signal.aborted) return { throttled: false, candidates };
 
