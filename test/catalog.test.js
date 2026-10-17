@@ -6,23 +6,32 @@ import { describe, it } from 'node:test';
 
 import {
   CATALOG_METADATA_UNKNOWN,
-  CONTEXT_WINDOW_SOURCE,
-  OUTPUT_LIMIT_SOURCE,
   CHAT_COMPLETIONS_PATH,
   RESPONSES_PATH,
   UPSTREAM_BASE_URL,
+  acceptsImage,
+  capabilityOf,
   contextWindowFor,
   displayNameFor,
   freeCandidates,
   hasTraceableCapabilities,
+  inputModalitiesFor,
   isFreeModel,
   isResponsesModel,
+  loadCapabilities,
   outputLimitFor,
   parseListing,
   pathForModel,
   pathForWire,
+  resetCapabilities,
   wireFor,
 } from '../src/catalog.js';
+
+/** 预置能力表：形状与 models.dev 的 `opencode.models[id]` 一致。 */
+async function seed(models) {
+  resetCapabilities();
+  await loadCapabilities({ fetchImpl: async () => ({ ok: true, json: async () => ({ opencode: { models } }) }) });
+}
 
 /** 真实清单的形状（实测：只有 id / object / created / owned_by）。 */
 const LISTING = {
@@ -86,46 +95,81 @@ describe('协议族判定', () => {
   });
 });
 
-describe('可溯源能力元数据', () => {
-  it('有来源的模型给出正的窗口值', () => {
+describe('能力元数据（运行时取自 models.dev 并透传）', () => {
+  const MODELS = {
+    'fledge-alpha-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+    'nemotron-3.5-lightning-free': { limit: { context: 262144, output: 262144 }, modalities: { input: ['text'] } },
+    'mimo-v2.6-flash-free': {
+      limit: { context: 200000, output: 32000 },
+      modalities: { input: ['text', 'image', 'audio', 'video'] },
+    },
+  };
+
+  it('能力表就绪后按 id 给出窗口与输出上限', async () => {
+    await seed(MODELS);
     assert.equal(contextWindowFor('fledge-alpha-free'), 1048576);
     assert.equal(contextWindowFor('nemotron-3.5-lightning-free'), 262144);
-    assert.equal(contextWindowFor('space-bunny-free'), 1048576);
-    assert.equal(hasTraceableCapabilities('exo-free'), true);
-    for (const [id, value] of Object.entries(CONTEXT_WINDOW_SOURCE)) {
-      assert.ok(Number.isSafeInteger(value) && value > 0, `${id} 的窗口值必须为正整数`);
-    }
-    // 计数型断言：空表/键名改坏时上面的循环会「零次通过」，因此必须锁定受检条数。
-    assert.equal(Object.keys(CONTEXT_WINDOW_SOURCE).length, 11, '受检窗口条目数');
+    assert.equal(outputLimitFor('fledge-alpha-free'), 131072);
+    assert.equal(outputLimitFor('mimo-v2.6-flash-free'), 32000);
+    assert.equal(hasTraceableCapabilities('fledge-alpha-free'), true);
+    assert.deepEqual(Object.keys(capabilityOf('fledge-alpha-free') ?? {}).sort(), ['limit', 'modalities']);
   });
 
-  it('没有来源的模型返回 undefined（调用方须省略 context）', () => {
+  it('占位形 id 与大小写无关：走 baseModelId 归一到基名', async () => {
+    await seed(MODELS);
+    const bare = contextWindowFor('fledge-alpha-free');
+    assert.equal(bare, 1048576);
+    // 带模型级后缀的写法应归一到同一基名。
+    assert.equal(contextWindowFor('fledge-alpha-free (latest)'), bare);
+  });
+
+  it('能力表里的模型透传模态；宿主不认识的 video/audio 被忽略', async () => {
+    await seed(MODELS);
+    assert.deepEqual(inputModalitiesFor('fledge-alpha-free'), ['text', 'image']);
+    assert.equal(acceptsImage('fledge-alpha-free'), true);
+    // 仅声明 text 的模型仍然只给 text。
+    assert.deepEqual(inputModalitiesFor('nemotron-3.5-lightning-free'), ['text']);
+    assert.equal(acceptsImage('nemotron-3.5-lightning-free'), false);
+    // 上游声明了 video/audio，但宿主的模态词汇表只有 text 与 image。
+    assert.deepEqual(inputModalitiesFor('mimo-v2.6-flash-free'), ['text', 'image']);
+  });
+
+  it('能力表里没有的 id 回退为纯文本、无窗口', async () => {
+    await seed(MODELS);
     assert.equal(contextWindowFor('jev-1.13-free'), undefined);
     assert.equal(contextWindowFor('some-future-model-free'), undefined);
-    assert.equal(hasTraceableCapabilities('jev-1.13-free'), false);
-  });
-
-  it('有输出上限来源的模型给出正的上限值', () => {
-    assert.equal(outputLimitFor('mimo-v2.6-flash-free'), 32000);
-    assert.equal(outputLimitFor('space-bunny-free'), 524288);
-    assert.equal(outputLimitFor('nemotron-3.5-lightning-free'), 262144);
-    for (const [id, value] of Object.entries(OUTPUT_LIMIT_SOURCE)) {
-      assert.ok(Number.isSafeInteger(value) && value > 0, id + ' 的输出上限必须为正整数');
-    }
-    // 计数型断言 + 与窗口表同键：两表取自同一次 models.dev 抓取、覆盖同一批 11 个免费 id，
-    // 因此键集合必须相同（jev-1.13-free 双双缺席）。空表或键名漂移都会在此失败。
-    assert.equal(Object.keys(OUTPUT_LIMIT_SOURCE).length, 11, '受检输出上限条目数');
-    assert.deepEqual(
-      Object.keys(OUTPUT_LIMIT_SOURCE).sort(),
-      Object.keys(CONTEXT_WINDOW_SOURCE).sort(),
-      '两张溯源表必须覆盖同一批模型 id',
-    );
-  });
-
-  it('没有输出上限来源的模型返回 undefined', () => {
     assert.equal(outputLimitFor('jev-1.13-free'), undefined);
-    assert.equal(outputLimitFor('some-future-model-free'), undefined);
-    assert.equal(Object.hasOwn(OUTPUT_LIMIT_SOURCE, 'jev-1.13-free'), false);
+    assert.equal(hasTraceableCapabilities('jev-1.13-free'), false);
+    assert.deepEqual(inputModalitiesFor('jev-1.13-free'), ['text']);
+    assert.equal(acceptsImage('jev-1.13-free'), false);
+  });
+
+  it('能力表未加载时一切按纯文本、无窗口处理，且不抛错', () => {
+    resetCapabilities();
+    assert.equal(contextWindowFor('fledge-alpha-free'), undefined);
+    assert.equal(outputLimitFor('fledge-alpha-free'), undefined);
+    assert.equal(capabilityOf('fledge-alpha-free'), undefined);
+    assert.deepEqual(inputModalitiesFor('fledge-alpha-free'), ['text']);
+    assert.equal(acceptsImage('fledge-alpha-free'), false);
+    assert.equal(hasTraceableCapabilities('fledge-alpha-free'), false);
+  });
+
+  it('拉取失败（非 2xx 或抛错）返回 undefined 且不缓存坏值', async () => {
+    resetCapabilities();
+    assert.equal(await loadCapabilities({ fetchImpl: async () => ({ ok: false, status: 500 }) }), undefined);
+    resetCapabilities();
+    assert.equal(await loadCapabilities({ fetchImpl: async () => { throw new Error('network down') } }), undefined);
+    // 失败后仍未缓存：模型仍按纯文本处理。
+    assert.equal(capabilityOf('fledge-alpha-free'), undefined);
+  });
+
+  it('成功加载后命中缓存：第二次调用不再发起请求', async () => {
+    resetCapabilities();
+    let calls = 0;
+    const fetchImpl = async () => { calls += 1; return { ok: true, json: async () => ({ opencode: { models: MODELS } }) } };
+    await loadCapabilities({ fetchImpl });
+    await loadCapabilities({ fetchImpl });
+    assert.equal(calls, 1, '缓存命中后不应重复拉取');
   });
 
   it('诊断码是稳定字符串', () => {

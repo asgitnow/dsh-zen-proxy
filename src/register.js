@@ -16,9 +16,11 @@ import {
   createAdapter,
 } from './adapter.js';
 import {
+  CAPABILITIES_UNAVAILABLE,
   CATALOG_METADATA_UNKNOWN,
   freeCandidates,
   hasTraceableCapabilities,
+  loadCapabilities,
 } from './catalog.js';
 import { resolveApiKey } from './credentials.js';
 import { FAILURE_CODE, FAILURE_SCOPE } from './failure.js';
@@ -104,7 +106,12 @@ export function register(ctx, config, options = {}) {
   const stateFile = options.stateFile ?? resolveStateFile({ env: process.env });
   let state = loadState(stateFile);
 
-  const adapter = createAdapter({ state: () => state, clientVersion: version, apiKey, regionRelay, fetchImpl });
+  // 宿主的 attachment 服务：图片字节由它按请求尺寸生成。缺失时图片块被丢弃、文本照发。
+  const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined;
+
+  const adapter = createAdapter({
+    state: () => state, clientVersion: version, apiKey, regionRelay, fetchImpl, attachments,
+  });
   adoptHostBaseClass(adapter);
 
   const controller = new AbortController();
@@ -140,6 +147,13 @@ export function register(ctx, config, options = {}) {
       // 清单拿不到时本轮作废：既有目录保持不动，不因一次拉取失败清空选择器。
       logger.warn?.(`zen-proxy: 模型清单拉取失败，本轮探测跳过：${error?.message ?? error}`);
       return { throttled: false, candidates: [] };
+    }
+
+    // 模型能力（含输入模态）来自 models.dev：模型能力是静态的，拉到什么就透传什么。
+    // 失败只影响 inputModalities 的声明，不影响清单与探测。
+    if (await loadCapabilities({ fetchImpl, signal: controller.signal }) === undefined) {
+      logger.warn?.(`zen-proxy: [${CAPABILITIES_UNAVAILABLE}] 模型能力表拉取失败，`
+        + '本轮目录按纯文本声明输入模态');
     }
 
     const candidates = freeCandidates(listing);

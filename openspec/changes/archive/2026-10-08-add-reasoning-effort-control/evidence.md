@@ -116,6 +116,11 @@ space-bunny-free                         1048576        524288  true
 11 行逐模型明细（每行含 `live.ctx` / `src.ctx` / `ev.ctx` / `reasoning` 与各自的 `ok`/`BAD` 标记）
 与 1 行 `---` 分隔符。完整 stdout 共 26 行，可用上述命令原样复现）：
 
+> ⚠️ **本块已被 2026-10-17 的复现块（见 (2c)）取代**：`verify-sources.mjs` 当时是三方对照，
+> 其中「仓库常量表」那条腿在 2026-10-17 随静态快照表的删除而消失（能力元数据改为运行时透传，
+> 见 `openspec/specs/zen-free-provider/spec.md` 的「能力元数据取自 models.dev 并透传」）。
+> 本块保留为 2026-10-08 的历史记录，**不可用当前脚本复现**。
+
 ```text
 受检模型数 checked=11
 live context 与 CONTEXT_WINDOW_SOURCE 不符 = 0
@@ -151,6 +156,51 @@ jev-1.13-free 是否缺席 models.dev = true
   参考实现用的是它自己的 `canDisableThinking === false` 标记（见 (2b)），两者不是同一个判据。
 - models.dev 的 `limit.output` 与参考实现的 maxOutput 表**不相同**（后者 nemotron 记 32768、
   mimo 记 131072、space-bunny 记 65536），说明参考表并非取自该来源；本变更取**可溯源**的那个。
+
+### (2c) 2026-10-17 复现：脚本已缩为两方对照
+
+静态快照表（`CONTEXT_WINDOW_SOURCE` / `OUTPUT_LIMIT_SOURCE`）已删除，能力元数据改为运行时
+从 models.dev 透传（含 `limit.context`、`limit.output`、`modalities.input`）。因此
+`verify-sources.mjs` 从「三方对照」缩为「归档表格 vs 上游实时值」**两方对照**——仓库侧不再有
+第三条腿可对。本节表格（11 条）仍然是它校验的对象，且**全部 11 条依然逐行相符**。
+
+下列是 `node scripts/verify-sources.mjs` 在 2026-10-17 的 stdout **逐字全文**（24 行，未省略）：
+
+```text
+GET https://models.dev/api.json -> 200
+exo-free                         live.ctx= 1048576 ev.ctx= 1048576 ok  | live.out= 131072 ev.out= 131072 ok  | reasoning=true ok 
+fledge-alpha-free                live.ctx= 1048576 ev.ctx= 1048576 ok  | live.out= 131072 ev.out= 131072 ok  | reasoning=true ok 
+ling-3.0-flash-fin-free          live.ctx=  262144 ev.ctx=  262144 ok  | live.out=  32768 ev.out=  32768 ok  | reasoning=true ok 
+ling-3.1-flash-free              live.ctx=  262144 ev.ctx=  262144 ok  | live.out=  32768 ev.out=  32768 ok  | reasoning=true ok 
+longcat-2.5-preview-free         live.ctx= 1000000 ev.ctx= 1000000 ok  | live.out= 131072 ev.out= 131072 ok  | reasoning=true ok 
+mimo-v2.6-flash-free             live.ctx=  200000 ev.ctx=  200000 ok  | live.out=  32000 ev.out=  32000 ok  | reasoning=true ok 
+muse-spark-1.2-contributor-free  live.ctx= 1048576 ev.ctx= 1048576 ok  | live.out= 131072 ev.out= 131072 ok  | reasoning=true ok 
+muse-spark-1.3-contributor-free  live.ctx= 1048576 ev.ctx= 1048576 ok  | live.out= 131072 ev.out= 131072 ok  | reasoning=true ok 
+nemotron-3.5-lightning-free      live.ctx=  262144 ev.ctx=  262144 ok  | live.out= 262144 ev.out= 262144 ok  | reasoning=true ok 
+nemotron-3-ultra-free            live.ctx= 1000000 ev.ctx= 1000000 ok  | live.out= 128000 ev.out= 128000 ok  | reasoning=true ok 
+space-bunny-free                 live.ctx= 1048576 ev.ctx= 1048576 ok  | live.out= 524288 ev.out= 524288 ok  | reasoning=true ok 
+---
+受检模型数 checked=11
+evidence.md context 列与实时值不符 = 0
+evidence.md output  列与实时值不符 = 0
+evidence.md reasoning 列与实时值不符 = 0
+reasoning===true = 11, 其它 = 0
+evidence.md 解析到的行数 = 11
+opencode 模型总数 = 127
+其中 id 以 -free 结尾 = 42
+jev-1.13-free 是否在能力表里 = false
+
+综合判定：不符总数 = 0（全部一致）
+```
+
+- **`jev-1.13-free` 依然缺席 models.dev**（`= false` 指「不在能力表里」，与 2026-10-08 的结论一致）。
+  本轮曾一度误称「它其实有完整数据、是旧表漏了它」——那是只查了 models.dev 自身的 `-free`
+  条目、未与上游清单交叉验证得出的错误结论。以**上游当前列出的 9 个免费模型**为口径复核，
+  覆盖率为 **8/9**，唯一缺口就是 `jev-1.13-free`（models.dev 的 127 个 opencode 条目里无任何 `jev`）。
+- 上游清单模型总数已从 2026-10-08 的 119（models.dev 侧）变为 2026-10-17 的 127（models.dev 侧）
+  / 85（上游 `/zen/v1/models` 侧，其中 `-free` 9 个）。两个数字口径不同，不可互换引用。
+- 本块的「逐字全文」断言由 `verify-evidence-matches-script.mjs` 用「连续后缀 + 声明省略行数」
+  双重校验；2026-10-08 的旧块因口径已变而**不再可复现**，已在 (2) 处标注取代关系。
 
 ### 本表勘误（2026-10-08）
 

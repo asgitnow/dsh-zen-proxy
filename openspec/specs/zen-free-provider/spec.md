@@ -45,24 +45,38 @@
 - **WHEN** `ctx.llm.listModels('opencode-free')` 被调用
 - **THEN** 调用成功返回，不抛出 `INVALID_CATALOG`
 
-### Requirement: 能力元数据按可溯源来源，无来源即省略
+### Requirement: 能力元数据取自 models.dev 并透传
 
-上游 `GET /zen/v1/models` 实测只返回 `{id, object, created, owned_by}`（无免费标记、无协议族、无上下文窗口、无输出上限），且无可用详情端点（`/zen/v1/models/<id>` 返回 404，能力查询参数返回同一份清单）。适配器 SHALL NOT 编造能力数值：`context.contextWindow` 与 `defaultMaxTokens` SHALL 均为可选，仅当存在可溯源来源（已发布的 Zen 目录数据，并在代码注释与 `evidence.md` 记录来源 URL、取值日期、模型 id）时才提供；无可溯源来源的模型 SHALL 省略 `context` 字段，SHALL NOT 以保守下限或家族猜测填充。模型是否公布 SHALL 只取决于「免费 + 可用」两项判定，SHALL NOT 因元数据缺失而收缩目录。适配器 SHALL NOT 在精确模型信息中声明 `defaultMaxTokens`；请求体中的输出预算由 `zen-free-upstream-wire` 的「思考预算」需求约束。
+上游 `GET /zen/v1/models` 实测只返回 `{id, object, created, owned_by}`（无免费标记、无协议族、无上下文窗口、无输出上限、无输入模态），且无可用详情端点（`/zen/v1/models/<id>` 返回 404，`?include=capabilities` 与 `?include=modalities` 返回与基准逐字节相同的响应）。因此能力元数据 SHALL 取自 `https://models.dev/api.json` 的 `opencode` provider，并 SHALL 在进程内缓存（一轮请求至多拉取一次）。适配器 SHALL NOT 编造能力数值，SHALL NOT 依据模型 id 的命名猜测能力，也 SHALL NOT 在仓库内维护静态快照表。
+
+`context.contextWindow` SHALL 取自 `limit.context`、输出容量 SHALL 取自 `limit.output`、输入模态 SHALL 取自 `modalities.input`，三者 SHALL 按 `baseModelId` 归一后的 id 透传。输入模态 SHALL 只声明宿主 `ModelModalityMap` 认识的值（`text`、`image`）：`modalities.input` 含 `image` 时声明 `['text', 'image']`，否则声明 `['text']`；上游另有的 `video`/`audio`/`pdf` SHALL 被忽略，因为它们没有对应的宿主内容块。能力表中没有条目的模型 SHALL 回退为 `['text']` 且省略 `context`，SHALL NOT 因元数据缺失而收缩目录。适配器 SHALL NOT 在精确模型信息中声明 `defaultMaxTokens`；请求体中的输出预算由 `zen-free-upstream-wire` 的「思考预算」需求约束。
+
+能力表拉取失败 SHALL 只降级、不致命：SHALL 省略 `context`、SHALL 按 `['text']` 声明输入模态、SHALL 记录 `CAPABILITIES_UNAVAILABLE`，且 SHALL NOT 中断清单获取与可用性探测。
 
 #### Scenario: 模型信息解析不因元数据缺失而失败
 
 - **WHEN** `ctx.llm.resolveModelInfo('opencode-free', <某个已公布模型 id>)` 被调用
 - **THEN** 返回结果包含该模型 id，且不抛出 `INVALID_MODEL_INFO`、`INVALID_MODEL_CONTEXT` 或 `INVALID_MODEL_MAX_TOKENS`
 
-#### Scenario: 有来源时提供窗口
+#### Scenario: 能力表就绪时透传窗口
 
-- **WHEN** 解析的模型在能力表中存在可溯源窗口值
-- **THEN** 返回结果的 `context.contextWindow` 等于该溯源值且为正整数
+- **WHEN** 解析的模型在能力表中存在 `limit.context`
+- **THEN** 返回结果的 `context.contextWindow` 等于该值且为正整数
 
-#### Scenario: 无来源时省略而非填充
+#### Scenario: 能力表中没有该模型时省略而非填充
 
-- **WHEN** 解析的模型没有可溯源窗口值
+- **WHEN** 解析的模型在能力表中没有条目
 - **THEN** 返回结果不含 `context.contextWindow` 也不含 `defaultMaxTokens`，且该模型仍出现在该路由的 `listModels` 结果中
+
+#### Scenario: 输入模态按能力表透传
+
+- **WHEN** 该模型的 `modalities.input` 含 `image`
+- **THEN** 其 `inputModalities` 为 `['text', 'image']`；否则为 `['text']`
+
+#### Scenario: 上游声明宿主不认识的多模态类型
+
+- **WHEN** 该模型的 `modalities.input` 含 `video` 或 `audio` 但不含 `image`
+- **THEN** 其 `inputModalities` 为 `['text']`，且结果中不出现宿主词汇表以外的模态值
 
 ### Requirement: 插件配置面
 插件 SHALL 通过 `registerConfigurableProviders` 声明其两个路由，并 SHALL 提供一个可编辑的探测周期配置项，默认值为 10 分钟。

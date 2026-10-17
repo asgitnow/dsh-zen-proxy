@@ -484,3 +484,79 @@ dsh plugin --profile desktop add 'git+https://github.com/Yee-h/dsh-zen-proxy.git
 本轮 `dsh plugin …` 一度报「术语 'dsh' 不会被识别」，从 `runtime/cli/bin` 找到 shim 后才能执行；
 该 shim 会把 `plugin` 子命令**原样透传**给 pnpm（`--help` 打印的就是 pnpm 11.7.0 的帮助）。
 
+---
+
+## 2026-10-17 — 能力元数据改为运行时透传 + 图片输入支持
+
+### 交付
+
+- **图片输入打通**。宿主 `ImageBlock` 只带 `attachment` 引用，适配器经 attachment 服务
+  （`ctx.get('attachments')` → `readImageRequest`）取字节，编码成上游接受的形状：
+  chat → `{type:'image_url', image_url:{url:'data:…;base64,…'}}`，responses → `{type:'input_image'}`。
+  端到端实测：`nemotron-3.5-super-vl-free` 收到 512×512 绿底黄方块图后正确回答
+  「green」并复述「中央黄色方块、周围是绿色背景」。
+- **能力元数据改为运行时拉取并透传**。删除 `CONTEXT_WINDOW_SOURCE` / `OUTPUT_LIMIT_SOURCE`
+  两张静态快照表，改为 `loadCapabilities()` 拉 `models.dev/api.json` 并进程内缓存；
+  `limit.context`、`limit.output`、`modalities.input` 三项按 `baseModelId` 透传。
+  `inputModalitiesFor()` 只输出宿主认识的 `text`/`image`，上游另有的 `video`/`audio`/`pdf` 忽略。
+- 适配器新增 `imageRequestTarget()`（第 7 个覆写点），`createAdapter`/`register.js` 接线 `attachments`。
+- 测试 **189/189**（50 suites）；13 个非网络脚本实跑 `exit=0`；`verify-sources.mjs`
+  （两方对照）`checked=11`、不符 0。
+- 已装进 profile（`file:D:/dev/dsh-zen-proxy` → 删副本 + `pnpm update` 重装），
+  4 个源文件与仓库哈希一致。
+
+### 教训 22：把「缺口的稀缺性」先量出来再设计
+
+初版设计假设「有能力元数据的模型是少数」，于是维护静态快照表、并在没有来源时**省略**字段。
+实测推翻了这个假设，也暴露出这种「防御」本身的破坏性：
+
+- models.dev 的 `opencode` provider 对**上游列出的 8/9 个**免费模型都给出 `limit.context`
+  与 `limit.output`；唯一缺口是 `jev-1.13-free`（models.dev 127 条里无任何 `jev`）。
+- 而「没有来源就省略 `contextWindow`」会让宿主拿不到容量、上下文管理失控。用户在
+  「上下文窗口怎么可能没有」这一点上的判断是对的：**默认值缺失**比**默认值保守**危险得多。
+
+规则：决定「有就给、没有就省略」之前，先测一次覆盖率；覆盖率接近 100% 时，稀缺性假设
+不成立，省略分支就是纯粹的复杂度与风险。
+
+### 教训 23：口径必须说清是「谁的集合」，否则同一个数字会自相矛盾
+
+本轮我一度宣称「`jev-1.13-free` 有完整数据，是旧表漏了它」——**错误**。原因是只查了
+models.dev 自身的 `-free` 条目（42 个，`jev` 不在其中），没有与上游清单交叉验证就下结论。
+以「上游当前列出的免费模型」为口径，覆盖率是 8/9，`jev-1.13-free` 正是唯一缺口。
+
+- 同一个概念有多个集合时（models.dev 的 `-free` 42 个 / 上游清单的 `-free` 9 个 /
+  models.dev 全部 127 个），**写数字时必须带上集合名**；README 里已按此改。
+- 这条与教训 1 同族：**结论强度不能超过证据口径**。查了集合 A 就不能对集合 B 下断言。
+
+### 教训 24：改了被文档「逐字引用」的脚本，等于改了文档
+
+`verify-sources.mjs` 从三方对照缩为两方对照后，归档文档 (2) 里那段「逐字未改、可用上述命令
+原样复现」立刻变成假话——而文档本身没被编辑过。`verify-evidence-matches-script.mjs`
+如实报了 `失败检查数 = 3`。
+
+处理方式（保留历史 + 标注取代，不篡改归档）：
+
+- 在 (2) 的历史块上加 ⚠️ 注明「已被 (2c) 取代、不可用当前脚本复现」，**块内容一字不改**；
+- 新增 (2c) 记录 2026-10-17 的完整 stdout，并说明口径为何从三方变两方；
+- 校验脚本改为取**最后一个**含「受检模型数」的块，且「省略/完整性声明」只从**紧邻该块的
+  那一段散文**里读（原先从上一个代码块读到本块，会把中间勘误段的「未做任何修饰」吞进来，
+  使完整性检查恒为真——本轮自测才发现）。
+
+**教训 25：检查脚本自身要有变异测试，否则「通过」可能只是没检查。**
+
+本轮给 `verify-evidence-matches-script.mjs` 补了 4 条变异（删行、改数字、去掉完整性声明、
+谎称省略行数），全部被抓到后才采信它的 `exit=0`。此前它有一条**静默失效**的路径：
+散文范围取太宽 ⇒ `claimsComplete` 恒真。同类问题此前也出现过（教训 6、15、18）。
+
+**教训 26：自测用例本身可能无效。**
+
+变异测试第一次跑「去掉完整性声明」时显示未抓到，我一度以为检查器没问题——实际是被替换的
+文本根本没匹配上（替换 0 处），**测试自己没生效**。变异测试必须断言「替换确实发生了」
+（本轮改用 Python `assert old in t`），否则「未被抓到」这个结论不可信。
+
+### 教训 27：退化尺寸的图片不是「不支持图片」的证据
+
+第一轮探测用 1×1 PNG，上游返回 `500 Endpoint is unavailable`，我据此写下「上游拒绝图片」。
+换成 512×512 真实图片后同一条路径 3/3 成功。**用一个非法输入推出的能力结论是无效的**；
+判定「不支持」至少要用一个合法样本证伪。
+

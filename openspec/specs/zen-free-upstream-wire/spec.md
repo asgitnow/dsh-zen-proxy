@@ -110,7 +110,7 @@
 
 ### Requirement: 思考预算作为唯一可执行的控制
 
-本车道的网关接受 `reasoning_effort` 一类字段后不执行它们，唯一被执行的强度旋钮是输出预算。因此适配器 SHALL 把宿主解析出的档位折算为请求体的输出上限：chat 协议族写入 `max_tokens`，responses 协议族写入 `max_output_tokens`。档位预算 SHALL 取 2048、8192、模型输出容量三档，其中前两档各按 2 倍给出、容量档取该模型的输出容量（输出上限同时限制思考与正文）；容量项 SHALL 取自标注了来源 URL 与取值日期的溯源表，无溯源时回退到 32768。调用方显式给出的输出上限 SHALL 与档位预算取较小者：档位 SHALL NOT 突破它，它也 SHALL NOT 抬高预算。折算结果 SHALL 为不小于 512 的整数；非正数、`NaN` 与 `Infinity` SHALL 被视为「没有该上限」而不是 0。适配器 SHALL NOT 在请求体中发送 `reasoning_effort`、`thinking`、`enable_thinking` 或 `thinking_budget`。
+本车道的网关接受 `reasoning_effort` 一类字段后不执行它们，唯一被执行的强度旋钮是输出预算。因此适配器 SHALL 把宿主解析出的档位折算为请求体的输出上限：chat 协议族写入 `max_tokens`，responses 协议族写入 `max_output_tokens`。档位预算 SHALL 取 2048、8192、模型输出容量三档，其中前两档各按 2 倍给出、容量档取该模型的输出容量（输出上限同时限制思考与正文）；容量项 SHALL 取自 `models.dev` 的 `limit.output`（运行时按 id 透传，见 `zen-free-provider` 的「能力元数据」需求），取不到时回退到 32768。调用方显式给出的输出上限 SHALL 与档位预算取较小者：档位 SHALL NOT 突破它，它也 SHALL NOT 抬高预算。折算结果 SHALL 为不小于 512 的整数；非正数、`NaN` 与 `Infinity` SHALL 被视为「没有该上限」而不是 0。适配器 SHALL NOT 在请求体中发送 `reasoning_effort`、`thinking`、`enable_thinking` 或 `thinking_budget`。
 
 #### Scenario: 带预算的 chat 请求
 
@@ -141,3 +141,34 @@
 
 - **WHEN** 任一协议族的请求被构造
 - **THEN** 请求体中不含 `reasoning_effort`、`thinking`、`enable_thinking` 或 `thinking_budget`
+
+### Requirement: 图片块编码为上游接受的形状
+
+宿主的 `ImageBlock` 只携带 `attachment` 引用（不含字节）。适配器 SHALL 经宿主的 attachment 服务（`readImageRequest`）按请求尺寸取出图片字节，并 SHALL 编码成上游接受的形状：
+
+- chat 协议族：`{type: 'image_url', image_url: {url: 'data:<mediaType>;base64,<bytes>'}}`；
+- responses 协议族：`{type: 'input_image', image_url: 'data:<mediaType>;base64,<bytes>'}`。
+
+data URL 的媒体类型 SHALL 取自 attachment 服务返回的 `mediaType`，SHALL NOT 由文件扩展名推断。单张图片取字节失败 SHALL NOT 中断整轮请求：该块被丢弃，其余文本与图片照常发出。attachment 服务不可用时 SHALL 丢弃全部图片块，请求中的文本部分 SHALL 照常发出。
+
+无图片的消息 SHALL 保持纯字符串 content（`chat`）或单个 `input_text`（`responses`），SHALL NOT 因引入图片支持而改变原有形状。
+
+#### Scenario: chat 请求携带图片
+
+- **WHEN** 一条 user 消息同时含文本块与图片块，目标模型为 chat 协议族
+- **THEN** 该消息的 `content` 为数组，先含 `{type:'text'}` 再含 `{type:'image_url', image_url:{url:'data:image/…;base64,…'}}`
+
+#### Scenario: responses 请求携带图片
+
+- **WHEN** 一条 user 消息同时含文本块与图片块，目标模型为 responses 协议族
+- **THEN** 该消息的 `content` 为数组，先含 `{type:'input_text'}` 再含 `{type:'input_image', image_url:'data:image/…;base64,…'}`
+
+#### Scenario: 无图片时形状不变
+
+- **WHEN** 一条 user 消息只含文本块
+- **THEN** chat 请求的该消息 `content` 为纯字符串，responses 请求为单个 `input_text` 块，均不含任何图片类型
+
+#### Scenario: 取不到图片字节时降级而非失败
+
+- **WHEN** attachment 服务不可用或对某个引用抛出错误
+- **THEN** 请求仍被构造并发出，不含该图片，文本部分完整保留

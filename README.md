@@ -208,8 +208,11 @@ HTTP 状态码 403，无论走 `/chat/completions` 还是 `/responses`、无论�
   本机复核 `mimo-v2.6-flash-free` 的占比为 33%-43%（`evidence.md` (1)），落在边界内：
   `light` 档实测正文 3117 token（预算 4096、思考 979）。参考实现曾在同一模型上测得约 82%
   （92 次调用，见 `evidence.md` (2b)），该占比与 2 倍系数**不相容**，本机未复现，故未按它标定。
-- **容量取自哪里**：`models.dev` 的 `limit.output`，逐条溯源与取值日期写在 `src/catalog.js`
-  的 `OUTPUT_LIMIT_SOURCE` 注释里。没有溯源的模型（`jev-1.13-free`）回退到 32768。
+- **容量取自哪里**：`models.dev` 的 `limit.output`，运行时按 id 透传（见 `src/catalog.js`
+  的 `CAPABILITIES_URL`）。覆盖率**不是 100%**：2026-10-17 实测上游列出的 9 个免费模型中，
+  8 个在 models.dev 有条目，唯一缺口是 `jev-1.13-free`（models.dev 的 127 个 opencode
+  条目里没有任何 `jev`）。因此该模型的 `context` 被省略、输出容量回退到 32768，
+  它的「深度」档也随之回退。能力表拉取失败时所有模型都走这条回退路径。
 - **档位名称里的数字是发出预算的千位表示**：菜单上的 `精简 · 4 K` 与请求体里的 `4096`
   由同一次折算得出，不存在两套算法（回归测试锁死这一点）。容量不是 1024 的整数倍时按
   四舍五入显示，例如 `mimo-v2.6-flash-free` 的容量 32000 显示为 `深度 · 31 K`。
@@ -285,14 +288,28 @@ user-agent: deepseek-harness/<version> (+https://github.com/deepseek-ai/deepseek
    真实连通性是未验证项。
 3. **免费配额仍然存在**。身份伪装只是让请求看起来来自官方客户端，不能创造配额；配额按会话
    池化，用满后会返回 `429 FreeUsageLimitError`（映射为 `RATE_LIMIT`），退避或等窗口恢复。
-4. **首版不支持图片输入**。目录里每个模型都声明 `inputModalities: ['text']`，宿主会把图片
-   投影成文本占位符，适配器永远不需要处理图片块。
-5. **能力元数据只有上下文窗口与输出上限，且只有部分模型有**。上游清单不提供任何能力字段，
-   `contextWindow` 与输出容量只在有可溯源来源时给出（来源与取值日期见
-   `openspec/changes/archive/2026-10-07-add-opencode-free-provider/evidence.md`），无来源的模型省略
-   `context` 但**仍会出现在目录中**；`jev-1.13-free` 既无窗口也无输出上限溯源，它的「深度」档
-   因此回退到 32768。刻意不声明 `defaultMaxTokens`：它与档位无关，无法表达思考强度差异，
-   请求体的输出预算改由档位折算给出（见「思考强度」）。
+4. **图片输入按能力表透传，不按 id 猜测**。输入模态取自 `models.dev` 的 `modalities.input`：
+   含 `image` 的模型声明 `['text', 'image']`，其余声明 `['text']`。宿主据此决定是否把
+   `ImageBlock` 交给适配器；收到图片块的适配器经 attachment 服务取出字节，编码成上游接受的
+   形状（chat → `image_url` 的 data URL，responses → `input_image`）。实测
+   `nemotron-3.5-super-vl-free` 收图后能正确描述内容。2026-10-17 上游列出的 9 个免费模型中，
+   6 个声明了 `image`（`deepseek-v4.1-flash-free`、`glm-5.3-flash-free`、
+   `longcat-2.5-preview-free`、`mimo-v2.6-flash-free`、`nemotron-3.5-super-vl-free`、
+   `space-bunny-free`），2 个仅文本，`jev-1.13-free` 无条目即无图片。
+   - 上游另声明了 `video`(11) / `audio`(5) / `pdf`(4)，**不声明**：宿主的 `ModelModalityMap`
+     只定义 `text` 与 `image`，且 `ImageBlock` 是唯一的多媒体内容块，文件永远被投影成文本。
+     声明宿主没有的类型只会写出非法值。
+   - 探测时不要用 1×1 之类退化尺寸的图：上游 vision 预处理会对它返回 `500 Endpoint is
+     unavailable`，那是图片无效，不是「模型不支持图片」。
+5. **能力元数据运行时拉取，不在仓库里维护快照**。上游清单只给
+   `id`/`object`/`created`/`owned_by` 四个字段，不含任何能力信息（`?include=capabilities`
+   与 `?include=modalities` 返回逐字节相同的响应，`/models/<id>` 404），因此能力取自
+   `models.dev/api.json` 的 `opencode` provider：`limit.context`、`limit.output`、
+   `modalities.input` 三项都按 id 透传。进程内缓存，一轮请求只拉一次。
+   刻意不声明 `defaultMaxTokens`：它与档位无关，无法表达思考强度差异，请求体的输出预算
+   改由档位折算给出（见「思考强度」）。
+   - 能力表拉取失败只降级、不致命：目录按纯文本声明输入模态，`context` 省略，日志给出
+     `CAPABILITIES_UNAVAILABLE`。
 6. **档位 id 不跨 provider 通用，本车道不做别名**。本车道的档位是 `light` / `balanced` / `deep`；
    若把别的 provider 的档位（例如 `high`、`medium`）带给本车道的模型，宿主会在调用适配器**之前**
    抛 `UNSUPPORTED_REASONING_EFFORT`——这是宿主既定行为（不 clamp、不 alias），本插件也不做映射，
@@ -315,9 +332,9 @@ npm test             # node:test，覆盖全部纯逻辑模块与适配器行为
 每个脚本都用 `import.meta.dirname` 推导路径，在任意 checkout 位置都能直接运行：
 
 ```powershell
-node scripts/verify-sources.mjs                    # models.dev 实时值 / 常量表 / 文档表格 三方对照
+node scripts/verify-sources.mjs                    # models.dev 实时值 / 归档文档表格 两方对照
 node scripts/verify-evidence-matches-script.mjs    # 文档粘贴块与脚本真实 stdout 逐行比对
-node scripts/verify-all-models-ladder.mjs          # 11 个模型逐档核对菜单名称与预算一致
+node scripts/verify-all-models-ladder.mjs          # 全部免费模型逐档核对菜单名称与预算一致
 node scripts/verify-catalog-resolve-consistency.mjs # 目录里每个 id 都能解析出合法档位菜单
 node scripts/verify-foreign-effort.mjs             # 跨 provider 档位 id 被宿主拒绝、未指定则落默认档
 node scripts/e2e-tiers.mjs                         # 档位 → 宿主校验 → 请求体预算 端到端
@@ -330,6 +347,8 @@ node scripts/verify-version.mjs                    # package.json / lock 三处�
 
 `scripts/effort.mjs`、`scripts/tiers.mjs`、`scripts/limits.mjs`、`scripts/final-consistency-scan.mjs`
 是直连上游/扫描仓库的实测脚本，其中前两个会真实调用 `https://opencode.ai`。
+`scripts/probe-image.mjs` 与 `scripts/probe-e2e.mjs` 是图片通路的实测脚本：前者对照两条端点的
+收图行为（`PROBE_PNG` 指定 base64 图片），后者端到端验证「能力表透传 + 图片真发 + 模型读出内容」。
 
 模块边界：
 
@@ -338,18 +357,18 @@ node scripts/verify-version.mjs                    # package.json / lock 三处�
 | `index.js` | 薄入口：`name` / `inject` / `Config` / `apply` |
 | `src/identity.js` | 身份头与版本门槛、会话/请求 id 派生（**含上面那处偏离的注释**） |
 | `src/http.js` | 上游请求封装、SSE 解码、错误分类接线 |
-| `src/catalog.js` | 清单解析、免费过滤、协议族判定、可溯源能力元数据 |
+| `src/catalog.js` | 清单解析、免费过滤、协议族判定、能力元数据（运行时取自 models.dev） |
 | `src/effort.js` | 思考档位阶梯与「档位 → 输出预算」折算（宿主无关纯逻辑） |
 | `src/probe.js` | 单模型探测与判定 |
 | `src/state.js` | 判定状态机与持久化 |
 | `src/schedule.js` | 周期调度与退避 |
-| `src/messages.js` | harness 消息 → 两种 wire 请求体 |
+| `src/messages.js` | harness 消息 → 两种 wire 请求体（含图片块 → `image_url` / `input_image`） |
 | `src/tools.js` | 工具四连补齐与名称回写 |
 | `src/chunks.js` | `StreamChunk` 构造、块索引追踪、用量换算 |
 | `src/chat.js` | chat 族 SSE → `StreamChunk` |
 | `src/responses.js` | responses 族 SSE → `StreamChunk` |
 | `src/failure.js` | 失败分类与失败对象构造 |
-| `src/adapter.js` | 适配器（六点：`providerInfo`/`providerRetryPolicy`/`imageRequestPricing`/`listModels`/`resolveModel`/`prepareCall`） |
+| `src/adapter.js` | 适配器（`providerInfo`/`providerRetryPolicy`/`imageRequestPricing`/`imageRequestTarget`/`listModels`/`resolveModel`/`prepareCall`），并经 attachment 服务解析图片字节 |
 | `src/register.js` | 宿主接线（唯一接触 `@deepseek-ai/*` 的地方） |
 
 除 `src/register.js` 外没有任何模块 import 宿主包，因此全部纯逻辑都能在仓库内直接单测。

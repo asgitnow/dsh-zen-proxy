@@ -42,6 +42,77 @@ function toolCallsOf(content) {
   return content.filter((block) => block?.type === 'tool-call');
 }
 
+/**
+ * 收集消息里出现过的图片引用（按首次出现顺序去重）。
+ *
+ * 宿主的 `ImageBlock` 不带字节，只有 `attachment` 引用；字节由调用方经
+ * `attachments.readImageRequest()` 异步取出后，以 `attachmentId → data URL` 的
+ * Map 交给本模块的构造函数。
+ *
+ * @param {unknown} messages
+ * @returns {object[]}
+ */
+export function imageRefsOf(messages) {
+  const refs = new Map();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!Array.isArray(message?.content)) continue;
+    for (const block of message.content) {
+      if (block?.type !== 'image') continue;
+      const id = block.attachment?.attachmentId;
+      if (typeof id === 'string' && id !== '') refs.set(id, block.attachment);
+    }
+  }
+  return [...refs.values()];
+}
+
+/**
+ * 组装 user 轮的 chat content：无图片时是纯字符串，有图片时是 parts 数组。
+ * @param {unknown} content
+ * @param {Map<string, string> | undefined} images `attachmentId → data URL`
+ * @returns {string | object[]}
+ */
+function chatUserContent(content, images) {
+  if (!Array.isArray(content)) return typeof content === 'string' ? content : '';
+  let text = '';
+  const parts = [];
+  for (const block of content) {
+    if (typeof block === 'string') { text += block; continue; }
+    if (block?.type === 'text' && typeof block.text === 'string') { text += block.text; continue; }
+    if (block?.type !== 'image') continue;
+    const url = images?.get(block.attachment?.attachmentId);
+    // 取不到字节就不发该块：宁缺勿发一个上游必然拒绝的形状。
+    if (typeof url !== 'string') continue;
+    parts.push({ type: 'image_url', image_url: { url } });
+  }
+  if (parts.length === 0) return text;
+  return text === '' ? parts : [{ type: 'text', text }, ...parts];
+}
+
+/**
+ * 组装 user 轮的 responses content：无图片时是单个 `input_text`。
+ * @param {unknown} content
+ * @param {Map<string, string> | undefined} images `attachmentId → data URL`
+ * @returns {object[]}
+ */
+function responsesUserContent(content, images) {
+  if (!Array.isArray(content)) {
+    const text = typeof content === 'string' ? content : '';
+    return text === '' ? [] : [{ type: 'input_text', text }];
+  }
+  let text = '';
+  const images_ = [];
+  for (const block of content) {
+    if (typeof block === 'string') { text += block; continue; }
+    if (block?.type === 'text' && typeof block.text === 'string') { text += block.text; continue; }
+    if (block?.type !== 'image') continue;
+    const url = images?.get(block.attachment?.attachmentId);
+    if (typeof url !== 'string') continue;
+    images_.push({ type: 'input_image', image_url: url });
+  }
+  const parts = text === '' ? [] : [{ type: 'input_text', text }];
+  return [...parts, ...images_];
+}
+
 function positiveLimit(value) {
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
@@ -63,9 +134,10 @@ function samplingFields(wire, { temperature, stop }) {
 /**
  * 构造 chat 协议族的 `messages` 数组。
  * @param {unknown} messages
+ * @param {Map<string, string> | undefined} [images] `attachmentId → data URL`
  * @returns {object[]}
  */
-export function chatMessages(messages) {
+export function chatMessages(messages, images) {
   const out = [];
   for (const message of Array.isArray(messages) ? messages : []) {
     if (typeof message !== 'object' || message === null) continue;
@@ -75,9 +147,12 @@ export function chatMessages(messages) {
       case 'developer':
         if (text !== '') out.push({ role: 'system', content: text });
         break;
-      case 'user':
-        if (text !== '') out.push({ role: 'user', content: text });
+      case 'user': {
+        const content = chatUserContent(message.content, images);
+        const empty = content === '' || (Array.isArray(content) && content.length === 0);
+        if (!empty) out.push({ role: 'user', content });
         break;
+      }
       case 'assistant': {
         const calls = toolCallsOf(message.content);
         if (text === '' && calls.length === 0) break;
@@ -117,7 +192,7 @@ export function chatMessages(messages) {
  * @param {unknown} messages
  * @returns {object[]}
  */
-export function responsesInput(messages) {
+export function responsesInput(messages, images) {
   const out = [];
   for (const message of Array.isArray(messages) ? messages : []) {
     if (typeof message !== 'object' || message === null) continue;
@@ -127,9 +202,11 @@ export function responsesInput(messages) {
       case 'developer':
         if (text !== '') out.push({ type: 'message', role: 'system', content: [{ type: 'input_text', text }] });
         break;
-      case 'user':
-        if (text !== '') out.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text }] });
+      case 'user': {
+        const content = responsesUserContent(message.content, images);
+        if (content.length > 0) out.push({ type: 'message', role: 'user', content });
         break;
+      }
       case 'assistant': {
         if (text !== '') out.push({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
         for (const [index, block] of toolCallsOf(message.content).entries()) {
@@ -162,10 +239,10 @@ export function responsesInput(messages) {
  *          maxTokens?: number, temperature?: number, stop?: string[]}} input
  * @returns {object}
  */
-export function buildChatRequest({ model, messages, tools, toolChoice, maxTokens, temperature, stop }) {
+export function buildChatRequest({ model, messages, tools, toolChoice, maxTokens, temperature, stop, images }) {
   const body = {
     model,
-    messages: chatMessages(messages),
+    messages: chatMessages(messages, images),
     stream: true,
     tools: Array.isArray(tools) ? tools : [],
     ...limitFields('chat', maxTokens),
@@ -178,13 +255,13 @@ export function buildChatRequest({ model, messages, tools, toolChoice, maxTokens
 /**
  * 构造一次 responses 协议族请求体。
  * @param {{model: string, messages?: unknown, tools?: object[], toolChoice?: string,
- *          maxTokens?: number, temperature?: number}} input
+ *          maxTokens?: number, temperature?: number, images?: Map<string,string>}} input
  * @returns {object}
  */
-export function buildResponsesRequest({ model, messages, tools, toolChoice, maxTokens, temperature }) {
+export function buildResponsesRequest({ model, messages, tools, toolChoice, maxTokens, temperature, images }) {
   const body = {
     model,
-    input: responsesInput(messages),
+    input: responsesInput(messages, images),
     stream: true,
     store: false,
     tools: Array.isArray(tools) ? tools : [],

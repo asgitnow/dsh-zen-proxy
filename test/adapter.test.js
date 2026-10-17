@@ -12,7 +12,24 @@ import {
   createAdapter,
 } from '../src/adapter.js';
 import { MODEL_STATE, emptyState } from '../src/state.js';
+import { resetCapabilities } from '../src/catalog.js';
 import { chatFinishFrame, chatFrame, collect, fakeFetch, sseResponse } from './fake-upstream.js';
+
+/**
+ * 预置能力表。
+ *
+ * 目录元数据（contextWindow / outputLimit / inputModalities）现在运行时取自
+ * `models.dev`，测试用 `fakeFetch` 桩住该请求即可；这里提供一个直接设置缓存的入口，
+ * 避免每个用例都拼一份完整清单。
+ * @param {Record<string, object>} models
+ */
+async function seedCapabilities(models) {
+  resetCapabilities();
+  const ok = await import('../src/catalog.js').then((m) => m.loadCapabilities({
+    fetchImpl: async () => ({ ok: true, json: async () => ({ opencode: { models } }) }),
+  }));
+  assert.ok(ok !== undefined, '能力表预置失败');
+}
 
 /** 网关接受但不执行的强度字段（实测见 `evidence.md` (1)）：适配器一律不在请求体里发送。 */
 const EFFORT_FIELDS = ['reasoning_effort', 'thinking', 'enable_thinking', 'thinking_budget'];
@@ -94,6 +111,18 @@ const mixedState = stateOf({
   'exo-free': MODEL_STATE.unavailable,
   'jev-1.13-free': MODEL_STATE.unknown,
 });
+
+/**
+ * 与 `mixedState` 对应的能力表（取自 models.dev 的真实值）：
+ * 前两个是视觉模型，`jev-1.13-free` 故意缺席以覆盖「能力表里没有」的分支。
+ */
+const mixedCapabilities = {
+  'fledge-alpha-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+  'nemotron-3.5-lightning-free': { limit: { context: 262144, output: 262144 }, modalities: { input: ['text'] } },
+  'muse-spark-1.3-contributor-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+  'muse-spark-1.2-contributor-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+  'exo-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+};
 
 describe('providerInfo', () => {
   it('两条路由都有非空 name，且 id 等于路由', () => {
@@ -202,6 +231,7 @@ describe('思考强度菜单', () => {
 
 describe('resolveModel', () => {
   it('id 严格等于请求的模型，且字段集合不越出宿主接受的集合', async () => {
+    await seedCapabilities(mixedCapabilities);
     const adapter = createAdapter({ state: mixedState });
     const resolved = await adapter.resolveModel(ROUTE_MAIN, 'fledge-alpha-free');
     assert.equal(resolved.provider, ROUTE_MAIN);
@@ -209,13 +239,15 @@ describe('resolveModel', () => {
     assert.equal(typeof resolved.name, 'string');
     assert.ok(resolved.name.length > 0);
     assert.deepEqual(Object.keys(resolved).sort(), ['context', 'id', 'inputModalities', 'name', 'provider', 'reasoning']);
-    assert.deepEqual(resolved.inputModalities, ['text']);
+    // 能力表里 fledge-alpha-free 声明了 image，故透传两种模态。
+    assert.deepEqual(resolved.inputModalities, ['text', 'image']);
     assert.equal(resolved.systemPromptUpdate, undefined);
     assert.equal(resolved.toolUpdate, undefined);
     assert.deepEqual(resolved.reasoning.efforts.map((effort) => effort.id), ['light', 'balanced', 'deep']);
   });
 
   it('有可溯源来源的模型给出该 contextWindow', async () => {
+    await seedCapabilities(mixedCapabilities);
     const adapter = createAdapter({ state: mixedState });
     const resolved = await adapter.resolveModel(ROUTE_MAIN, 'fledge-alpha-free');
     assert.deepEqual(resolved.context, { contextWindow: 1048576 });

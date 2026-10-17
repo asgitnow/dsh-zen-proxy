@@ -22,13 +22,14 @@ import {
   outputLimitFor,
   contextWindowFor,
   displayNameFor,
+  inputModalitiesFor,
   pathForModel,
   wireFor,
 } from './catalog.js';
 import { DEFAULT_EFFORT, budgetFor, effortsFor } from './effort.js';
 import { requestUpstream } from './http.js';
 import { buildIdentityHeaders, requestForTurn, resolveClientVersion, sessionForConversation } from './identity.js';
-import { buildRequestFor } from './messages.js';
+import { buildRequestFor, imageRefsOf } from './messages.js';
 import { translateChatStream } from './chat.js';
 import { translateResponsesStream } from './responses.js';
 import { MODEL_STATE, modelsWithVerdict, viaOf } from './state.js';
@@ -54,9 +55,6 @@ export const ROUTE_VERDICTS = Object.freeze({
   [ROUTE_MAIN]: MODEL_STATE.available,
   [ROUTE_REGION]: MODEL_STATE.region,
 });
-
-/** 目录里每个模型都声明纯文本输入：宿主据此把图片块投影成占位符，适配器无需处理图片。 */
-const INPUT_MODALITIES = Object.freeze(['text']);
 
 /**
  * 某模型的思考强度菜单。
@@ -92,13 +90,14 @@ export function conversationIdentity(options) {
  * 创建一个适配器实例。
  * @param {{state: () => object, clientVersion?: string, apiKey?: string,
  *          regionRelay?: {url: string, token: string}, fetchImpl?: typeof fetch,
- *          timeoutMs?: number}} deps
+ *          attachments?: object, timeoutMs?: number}} deps
  *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）；
  *   `apiKey` 是已解析的免费车道凭据（见 `src/credentials.js`）；
- *   `regionRelay` 是区域中继（可选）：判定路径为 `relay` 的模型经它收发。
+ *   `regionRelay` 是区域中继（可选）：判定路径为 `relay` 的模型经它收发；
+ *   `attachments` 是宿主的 attachment 服务（可选）：图片字节由它按请求尺寸生成。
  * @returns {object} 六点齐全的适配器
  */
-export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetchImpl, timeoutMs }) {
+export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetchImpl, timeoutMs, attachments }) {
   const version = clientVersion ?? resolveClientVersion().version;
 
   function modelEntry(provider, modelId) {
@@ -107,7 +106,7 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
       provider,
       id: modelId,
       name: displayNameFor(modelId),
-      inputModalities: [...INPUT_MODALITIES],
+      inputModalities: [...inputModalitiesFor(modelId)],
       // 只在有可溯源来源时给出上下文窗口；无来源就省略（见 src/catalog.js）。
       ...contextWindow === undefined ? {} : { context: { contextWindow } },
       // 不声明 defaultMaxTokens：宿主会把它物化成请求的输出上限，而它与档位无关，
@@ -131,9 +130,23 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
       return undefined;
     },
 
-    /** 不按视觉 token 计价：目录里所有模型都是纯文本输入。 */
+    /** 不按视觉 token 计价。 */
     imageRequestPricing() {
       return undefined;
+    },
+
+    /**
+     * 宿主据此决定把图片压缩到多大再交给适配器。
+     * 本车道不额外限制：沿用归一化后的原图尺寸与字节数。
+     * @param {string} provider
+     * @param {string} model
+     * @param {{width: number, height: number, bytes: number}} image
+     * @returns {{width: number, height: number, maxBytes: number}}
+     */
+    imageRequestTarget(provider, model, image) {
+      void provider;
+      void model;
+      return { width: image.width, height: image.height, maxBytes: image.bytes };
     },
 
     /**
@@ -148,7 +161,7 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
         provider,
         id: modelId,
         name: displayNameFor(modelId),
-        inputModalities: [...INPUT_MODALITIES],
+        inputModalities: [...inputModalitiesFor(modelId)],
       }));
     },
 
@@ -180,10 +193,40 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
       const resolved = this.resolveModel(provider, model);
       return {
         model: resolved,
-        stream: (options) => streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs }),
+        stream: (options) => streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs, attachments }),
       };
     },
   };
+}
+
+/**
+ * 把消息里的图片块解析成 `attachmentId → data URL`。
+ *
+ * 宿主的 `ImageBlock` 只带 `attachment` 引用，字节由 attachment 服务按请求尺寸
+ * 生成（`readImageRequest`）。没有服务或取不到字节时返回空 Map，图片块会被丢弃。
+ *
+ * @param {unknown} messages
+ * @param {{readImageRequest?: Function} | undefined} attachments
+ * @param {AbortSignal | undefined} signal
+ * @returns {Promise<Map<string, string>>}
+ */
+async function resolveImages(messages, attachments, signal) {
+  const images = new Map();
+  if (typeof attachments?.readImageRequest !== 'function') return images;
+  for (const ref of imageRefsOf(messages)) {
+    try {
+      const version = await attachments.readImageRequest(
+        ref,
+        { width: ref.width, height: ref.height, maxBytes: ref.bytes },
+        signal,
+      );
+      const b64 = Buffer.from(version.data).toString('base64');
+      images.set(ref.attachmentId, `data:${version.mediaType};base64,${b64}`);
+    } catch {
+      // 单张图取失败不应中断整轮：该块被丢弃，其余文本与图片照发。
+    }
+  }
+  return images;
 }
 
 /**
@@ -193,10 +236,11 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
  * 分片。取消则本流自己产出一个 `{kind:'aborted'}` 的终止 `finish`。
  * @param {object} options 宿主的 `GenerateOptions`
  * @param {{version: string, apiKey?: string, regionRelay?: {url: string, token: string},
- *          state: () => object, fetchImpl?: typeof fetch, timeoutMs?: number}} context
+ *          state: () => object, fetchImpl?: typeof fetch, timeoutMs?: number,
+ *          attachments?: object}} context
  * @returns {AsyncGenerator<object>}
  */
-async function* streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs }) {
+async function* streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs, attachments }) {
   const modelId = String(options?.model ?? '');
   const signal = options?.signal;
   if (signal?.aborted === true) {
@@ -213,9 +257,12 @@ async function* streamTurn(options, { version, apiKey, regionRelay, state, fetch
   const wire = wireFor(modelId);
   const { session, requestId } = conversationIdentity(options);
   const { tools, rename, toolChoice } = applyToolQuartet(options?.tools, { style: wire, toolChoice: true });
+  // 图片块只带 attachment 引用，字节要经宿主的 attachment 服务取出后交给 wire。
+  const images = await resolveImages(options?.messages, attachments, signal);
   const body = buildRequestFor(wire, {
     model: modelId,
     messages: options?.messages,
+    images,
     tools,
     toolChoice,
     // 本车道唯一被执行的强度旋钮：把宿主解析出的档位折算成输出上限。

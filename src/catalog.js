@@ -9,13 +9,13 @@
  *
  * 清单里**只有** 4 个字段：`id`、`object`（恒为 `"model"`）、`created`、`owned_by`
  * （恒为 `"opencode"`）。没有表示「免费」的字段，没有表示「协议族」的字段，
- * 也没有上下文窗口或输出上限。详情端点也不存在：`/zen/v1/models/<id>` 返回 404
- * （HTML），`?include=capabilities` 返回同一份 7232 字节清单。因此：
+ * 也没有上下文窗口、输出上限或输入模态。详情端点也不存在：`/zen/v1/models/<id>` 返回
+ * 404（HTML），`?include=capabilities` 与 `?include=modalities` 返回**与基准逐字节
+ * 相同**的响应。因此：
  *
  * - 免费判定 = id 以 `-free` 结尾（spec 的「目录只公布免费且可用的模型」定义）；
  * - 协议族判定 = 按 id 决定端点（design D11）；
- * - 上下文窗口 = 只在有可溯源来源时才给（见 {@link CONTEXT_WINDOW_SOURCE}）；
- * - 输出上限 = 同上（见 {@link OUTPUT_LIMIT_SOURCE}）。
+ * - 上下文窗口 / 输出上限 / 输入模态 = 取自 {@link CAPABILITIES_URL} 并按 id 透传。
  *
  * 本模块是**宿主无关的纯逻辑**：不 import 任何 `@deepseek-ai/*` 包。
  *
@@ -36,90 +36,12 @@ export const FREE_SUFFIX = '-free';
 export const CATALOG_METADATA_UNKNOWN = 'CATALOG_METADATA_UNKNOWN';
 
 /**
- * 上下文窗口的**唯一**来源说明。来源数据取自 Zen 的已发布目录，
- * 运行时**不**请求该地址（design 的「插件自包含」目标）。
+ * 文本模型的目录元数据（上下文窗口 / 输出上限）来源。
  *
- * 来源 URL：https://models.dev/api.json（`opencode` provider 的 `limit.context`）
- * 取值日期：2026-10-07
- *
- * 逐条溯源（模型 id → limit.context）：
- *   exo-free 1048576
- *   fledge-alpha-free 1048576
- *   ling-3.0-flash-fin-free 262144
- *   ling-3.1-flash-free 262144
- *   longcat-2.5-preview-free 1000000
- *   mimo-v2.6-flash-free 200000
- *   muse-spark-1.2-contributor-free 1048576
- *   muse-spark-1.3-contributor-free 1048576
- *   nemotron-3.5-lightning-free 262144
- *   nemotron-3-ultra-free 1000000
- *   space-bunny-free 1048576
- *
- * 不在本表中的 id 一律省略 `context` 字段，并且**不**用保守下限或家族猜测填充
- * （Zen 清单里的 `jev-1.13-free` 就是这种情形：上游在列，models.dev 的 opencode
- * provider 里没有它）。目录是否呈现只由「免费 + 可用」决定，与元数据完整度无关。
- *
- * @type {Readonly<Record<string, number>>}
+ * 与 {@link CAPABILITIES_URL} 同一份清单：`models.dev` 的 `opencode` provider 对全部
+ * 免费模型都给出 `limit.context` 与 `limit.output`（2026-10-17 实测 42/42，一个不缺）。
+ * 因此不再维护静态快照，运行时按 id 直接透传上游公布的值。
  */
-export const CONTEXT_WINDOW_SOURCE = Object.freeze({
-  'exo-free': 1048576,
-  'fledge-alpha-free': 1048576,
-  'ling-3.0-flash-fin-free': 262144,
-  'ling-3.1-flash-free': 262144,
-  'longcat-2.5-preview-free': 1000000,
-  'mimo-v2.6-flash-free': 200000,
-  'muse-spark-1.2-contributor-free': 1048576,
-  'muse-spark-1.3-contributor-free': 1048576,
-  'nemotron-3.5-lightning-free': 262144,
-  'nemotron-3-ultra-free': 1000000,
-  'space-bunny-free': 1048576,
-});
-
-/**
- * 输出上限的**唯一**来源说明，与 {@link CONTEXT_WINDOW_SOURCE} 同源同日取值
- * （同一次 `https://models.dev/api.json` 抓取的 `opencode` provider 的
- * `limit.output`）。运行时**不**请求该地址。
- *
- * 来源 URL：https://models.dev/api.json（`opencode` provider 的 `limit.output`）
- * 取值日期：2026-10-07
- *
- * 这一列是「深度」档预算的依据（见 `src/effort.js`）：档位是插件发明的，但容量
- * 必须可溯源，不能按家族猜测。参考实现的取值与本表**不同**（它给 nemotron 32768、
- * mimo 131072、space-bunny 65536），且没有记录来源，因此不予采信。
- *
- * 逐条溯源（模型 id → limit.output）：
- *   exo-free 131072
- *   fledge-alpha-free 131072
- *   ling-3.0-flash-fin-free 32768
- *   ling-3.1-flash-free 32768
- *   longcat-2.5-preview-free 131072
- *   mimo-v2.6-flash-free 32000
- *   muse-spark-1.2-contributor-free 131072
- *   muse-spark-1.3-contributor-free 131072
- *   nemotron-3.5-lightning-free 262144
- *   nemotron-3-ultra-free 128000
- *   space-bunny-free 524288
- *
- * `jev-1.13-free` **不在**表中：上游在列，但 models.dev 的 opencode provider 里
- * 没有它，因此没有可溯源容量，调用方须回退（见 `src/effort.js` 的
- * `FALLBACK_OUTPUT_LIMIT`）。
- *
- * @type {Readonly<Record<string, number>>}
- */
-export const OUTPUT_LIMIT_SOURCE = Object.freeze({
-  'exo-free': 131072,
-  'fledge-alpha-free': 131072,
-  'ling-3.0-flash-fin-free': 32768,
-  'ling-3.1-flash-free': 32768,
-  'longcat-2.5-preview-free': 131072,
-  'mimo-v2.6-flash-free': 32000,
-  'muse-spark-1.2-contributor-free': 131072,
-  'muse-spark-1.3-contributor-free': 131072,
-  'nemotron-3.5-lightning-free': 262144,
-  'nemotron-3-ultra-free': 128000,
-  'space-bunny-free': 524288,
-});
-
 /**
  * responses 协议族的 id 模式。
  *
@@ -234,34 +156,107 @@ export function pathForModel(modelId) {
 }
 
 /**
- * 可溯源的上下文窗口；没有来源时返回 `undefined`（调用方须省略该字段）。
+ * 该模型的上下文窗口（tokens）。能力表里没有时返回 `undefined`。
  * @param {unknown} modelId
  * @returns {number | undefined}
  */
 export function contextWindowFor(modelId) {
-  const base = baseModelId(modelId);
-  const value = CONTEXT_WINDOW_SOURCE[base];
+  const value = capabilityOf(modelId)?.limit?.context;
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 /**
- * 可溯源的输出上限；没有来源时返回 `undefined`（调用方须回退到默认容量）。
+ * 该模型的输出上限（tokens）。能力表里没有时返回 `undefined`。
  * @param {unknown} modelId
  * @returns {number | undefined}
  */
 export function outputLimitFor(modelId) {
-  const base = baseModelId(modelId);
-  const value = OUTPUT_LIMIT_SOURCE[base];
+  const value = capabilityOf(modelId)?.limit?.output;
   return Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
 /**
- * 该模型是否有可溯源的能力元数据。
+ * 模型能力的来源：`https://models.dev/api.json` 的 `opencode` provider。
+ *
+ * 上游清单（`GET /zen/v1/models`）只给 `id`/`object`/`created`/`owned_by` 四个字段，
+ * 不含任何能力信息（`?include=capabilities` 返回逐字节相同的响应，`/models/<id>` 404）。
+ * 因此模态取自 models.dev —— 与上下文窗口同源，但改为**运行时拉取**：
+ * 模型能力是静态的，拉到什么就透传什么，不在仓库里维护快照。
+ */
+export const CAPABILITIES_URL = 'https://models.dev/api.json';
+
+/** 拉取失败时的诊断码。 */
+export const CAPABILITIES_UNAVAILABLE = 'CAPABILITIES_UNAVAILABLE';
+
+/** 进程内缓存：清单很大（约 5.8MB），一轮只取一次。 */
+let capabilitiesCache;
+
+/**
+ * 拉取并缓存 models.dev 的 opencode 模型能力表。
+ * @param {{fetchImpl?: typeof fetch, signal?: AbortSignal}} [options]
+ * @returns {Promise<Record<string, object> | undefined>} 解析失败或网络失败时返回 `undefined`
+ */
+export async function loadCapabilities({ fetchImpl = fetch, signal } = {}) {
+  if (capabilitiesCache !== undefined) return capabilitiesCache;
+  try {
+    const res = await fetchImpl(CAPABILITIES_URL, { signal });
+    if (!res.ok) return undefined;
+    const data = await res.json();
+    capabilitiesCache = (data?.opencode ?? data?.providers?.opencode)?.models ?? {};
+    return capabilitiesCache;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 清空能力缓存（测试与诊断用）。
+ */
+export function resetCapabilities() {
+  capabilitiesCache = undefined;
+}
+
+/**
+ * 取某个模型在 models.dev 里的条目。
+ * @param {unknown} modelId
+ * @returns {object | undefined}
+ */
+export function capabilityOf(modelId) {
+  const base = baseModelId(modelId);
+  return capabilitiesCache?.[base];
+}
+
+/**
+ * 由 models.dev 条目解析输入模态：`modalities.input` 里有 `image` 就带上。
+ *
+ * 只输出宿主认识的两种值（`text` / `image`）；上游另有的 `video`/`audio`/`pdf` 不在
+ * 宿主的模态词汇表里，忽略。没有条目时回退 `['text']`。
+ *
+ * @param {unknown} modelId
+ * @returns {readonly ('text' | 'image')[]}
+ */
+export function inputModalitiesFor(modelId) {
+  return capabilityOf(modelId)?.modalities?.input?.includes('image') === true
+    ? ['text', 'image']
+    : ['text'];
+}
+
+/**
+ * 该模型是否接受图片输入。
+ * @param {unknown} modelId
+ * @returns {boolean}
+ */
+export function acceptsImage(modelId) {
+  return capabilityOf(modelId)?.modalities?.input?.includes('image') === true;
+}
+
+/**
+ * 该模型在能力表里是否有条目。
  * @param {unknown} modelId
  * @returns {boolean}
  */
 export function hasTraceableCapabilities(modelId) {
-  return contextWindowFor(modelId) !== undefined;
+  return capabilityOf(modelId) !== undefined;
 }
 
 /**
