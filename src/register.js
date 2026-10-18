@@ -1,11 +1,15 @@
 /**
- * 宿主接线：注册两条 provider 路由、声明配置面、跑周期探测。
+ * 宿主接线：注册两条 provider 路由、声明配置面、周期刷新模型清单。
  *
  * 这是仓库里**唯一**接触宿主包的地方：它把适配器对象挂到真实的
  * `@deepseek-ai/dsh-llm` 的 `LlmAdapter.prototype` 上，使其成为真正的子类。
  * 该 import 是动态且容错的——宿主包在插件仓库内不可解析（宿主运行时注入），
  * 而本仓库的单元测试要能直接加载 `src/adapter.js`。除此之外，其余模块都不 import
  * 任何 `@deepseek-ai/*` 包。
+ *
+ * 目录不做探测：免费配额按会话计，周期探测会把自己打到 429（2026-10-18 实测
+ * 一轮 9 模型全部 `FreeUsageLimitError`）。轮次只做一件事——拉清单、把免费 id
+ * 存进目录；地区分组由配置 `regionModels` 指名。
  *
  * @module src/register.js
  */
@@ -24,7 +28,6 @@ import {
   setCapabilityOverrides,
 } from './catalog.js';
 import { resolveApiKey } from './credentials.js';
-import { FAILURE_CODE, FAILURE_SCOPE } from './failure.js';
 import { PROBE_TIMEOUT_MS, fetchModelListing } from './http.js';
 import {
   buildIdentityHeaders,
@@ -32,13 +35,10 @@ import {
   probeSession,
   resolveClientVersion,
 } from './identity.js';
-import { PROBE_STATE, probeModels } from './probe.js';
 import { createScheduler } from './schedule.js';
 import {
-  MODEL_STATE,
+  STATE_VERSION,
   loadState,
-  modelsWithVerdict,
-  reduceRound,
   resolveStateFile,
   saveState,
 } from './state.js';
@@ -61,11 +61,22 @@ function adoptHostBaseClass(adapter) {
     });
 }
 
+/** 把配置里的 regionModels 归一成去重后的 id 数组（非字符串项忽略）。 */
+function regionModelIds(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set();
+  for (const id of value) {
+    if (typeof id === 'string' && id !== '') seen.add(id);
+  }
+  return [...seen];
+}
+
 /**
  * 安装插件。
  * @param {object} ctx cordis 上下文（已 inject `llm`）
  * @param {{probeIntervalMinutes?: number, opencodeVersion?: string, apiKey?: string,
- *          capabilities?: Record<string, object>}} config
+ *          capabilities?: Record<string, object>, regionModels?: string[],
+ *          regionRelayUrl?: string, regionRelayToken?: string}} config
  * @param {{pluginName?: string, fetchImpl?: typeof fetch, stateFile?: string}} [options] 测试注入点
  * @returns {object} 供测试与诊断使用的接线句柄
  */
@@ -88,7 +99,7 @@ export function register(ctx, config, options = {}) {
   const credentials = () => resolveApiKey({ explicit: config?.apiKey });
 
   // 区域中继（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md），
-  // 让地区受限模型（RegionError）恢复可用。URL 不带尾斜杠；令牌经
+  // 让配置指名的地区受限模型恢复可用。URL 不带尾斜杠；令牌经
   // `x-zen-relay-token` 头交给 Worker 校验。
   const relayUrl = typeof config?.regionRelayUrl === 'string' ? config.regionRelayUrl.trim().replace(/\/+$/, '') : '';
   const relayToken = typeof config?.regionRelayToken === 'string' ? config.regionRelayToken.trim() : '';
@@ -97,18 +108,23 @@ export function register(ctx, config, options = {}) {
     logger.warn?.('zen-proxy: 已配置 regionRelayUrl 但 regionRelayToken 为空；'
       + 'Worker 开启了令牌校验时这些请求会被拒（403）。');
   }
-  const relayProbeHeaders = relayToken !== '' ? { 'x-zen-relay-token': relayToken } : undefined;
+  if (regionModelIds(config?.regionModels).length > 0 && regionRelay === undefined) {
+    logger.warn?.('zen-proxy: regionModels 指名了地区受限模型，但未配置 regionRelayUrl；'
+      + '这些模型将只能直连（上游会以 RegionError 拒绝当前出口）。');
+  }
 
   // 状态目录由宿主环境解析（DSH_HOME → 宿主配置根），不写死任何用户目录路径。
   // 显式传入的 stateFile 覆盖用给测试，生产路径始终来自环境解析。
   const stateFile = options.stateFile ?? resolveStateFile({ env: process.env });
-  let state = loadState(stateFile);
+  let catalog = loadState(stateFile);
 
   // 宿主的 attachment 服务：图片字节由它按请求尺寸生成。缺失时图片块被丢弃、文本照发。
   const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined;
 
   const adapter = createAdapter({
-    state: () => state, clientVersion: version, apiKey: credentials, regionRelay, fetchImpl, attachments,
+    state: () => catalog, clientVersion: version, apiKey: credentials,
+    regionModels: () => regionModelIds(config?.regionModels),
+    regionRelay, fetchImpl, attachments,
   });
   adoptHostBaseClass(adapter);
 
@@ -116,15 +132,9 @@ export function register(ctx, config, options = {}) {
   let roundSeed = 0;
   let warnedNoKey = false;
 
-  function logDiagnostics(diagnostics) {
-    for (const entry of diagnostics) {
-      logger.warn?.(`zen-proxy: [${entry.code}] ${entry.message}`);
-    }
-  }
-
   /**
-   * 跑一轮：取清单 → 过滤免费 → 探测 → 折算状态 → 持久化。
-   * @returns {Promise<{throttled: boolean, candidates: string[]}>}
+   * 跑一轮：取清单 → 过滤免费 → 存目录。
+   * @returns {Promise<{candidates: string[]}>}
    */
   async function runRound() {
     roundSeed += 1;
@@ -135,7 +145,7 @@ export function register(ctx, config, options = {}) {
       logger.warn?.('zen-proxy: 未找到 OpenCode 凭据。免费车道现在必须携带真实凭据：'
         + '在 opencode CLI 登录一次即自动读取（凭据存于 opencode.db，随重登/轮换自动更新），'
         + '或在插件配置 apiKey / 环境变量 OPENCODE_API_KEY 里给出。'
-        + '缺失期间探测会以 403 FreeTierError 失败，模型目录保持为空。');
+        + '缺失期间清单拉取会以 403 失败，模型目录保持为空。');
     }
     const session = probeSession();
     const requestId = deriveId('msg_', `listing\0${session}\0${round}`);
@@ -152,12 +162,12 @@ export function register(ctx, config, options = {}) {
       });
     } catch (error) {
       // 清单拿不到时本轮作废：既有目录保持不动，不因一次拉取失败清空选择器。
-      logger.warn?.(`zen-proxy: 模型清单拉取失败，本轮探测跳过：${error?.message ?? error}`);
-      return { throttled: false, candidates: [] };
+      logger.warn?.(`zen-proxy: 模型清单拉取失败，本轮跳过：${error?.message ?? error}`);
+      return { candidates: [] };
     }
 
     // 模型能力（含输入模态）来自 models.dev：模型能力是静态的，拉到什么就透传什么。
-    // 失败只影响 inputModalities 的声明，不影响清单与探测。
+    // 失败只影响 inputModalities 的声明，不影响清单与目录。
     if (await loadCapabilities({ fetchImpl, signal: controller.signal }) === undefined) {
       logger.warn?.(`zen-proxy: [${CAPABILITIES_UNAVAILABLE}] 模型能力表拉取失败，`
         + '本轮目录按纯文本声明输入模态');
@@ -173,62 +183,15 @@ export function register(ctx, config, options = {}) {
         + `将省略 context 字段（不影响它们在目录中的呈现）：${withoutMetadata.join(', ')}`);
     }
 
-    // 探测分组：直连为主；已判定「地区受限」的模型在配置了中继时改走中继探测，
-    // 中继探测判定可用即恢复进主目录（状态记 via: 'relay'，对话请求同路）。
-    const relaySet = regionRelay !== undefined
-      ? new Set(modelsWithVerdict(state, MODEL_STATE.region).filter((id) => candidates.includes(id)))
-      : new Set();
-    const directSet = candidates.filter((id) => !relaySet.has(id));
+    if (controller.signal.aborted) return { candidates };
 
-    const results = await probeModels(
-      directSet,
-      { round, version, apiKey, signal: controller.signal, fetchImpl, timeoutMs: PROBE_TIMEOUT_MS },
-      (modelId, result) => {
-        logger.info?.(`zen-proxy: 探测 ${modelId} → ${result.state}`);
-      },
-    );
-    if (relaySet.size > 0) {
-      const relayResults = await probeModels(
-        [...relaySet],
-        {
-          round, version, apiKey, baseUrl: regionRelay.url, extraHeaders: relayProbeHeaders,
-          signal: controller.signal, fetchImpl, timeoutMs: PROBE_TIMEOUT_MS,
-        },
-        (modelId, result) => {
-          logger.info?.(`zen-proxy: 探测 ${modelId}（经区域中继）→ ${result.state}`);
-        },
-      );
-      for (const [id, result] of Object.entries(relayResults)) {
-        results[id] = { ...result, via: 'relay' };
-      }
-    }
-
-    if (controller.signal.aborted) return { throttled: false, candidates };
-
-    // 插件级失败（身份／版本被拒）与具体模型无关：整条车道降级。
-    const pluginFailure = candidates
-      .map((id) => results[id])
-      .find((result) => result?.state === PROBE_STATE.unknown && result.failure?.scope === FAILURE_SCOPE.plugin);
-
-    const { state: next, diagnostics } = reduceRound(state, {
-      models: candidates,
-      results,
-      pluginFailure: pluginFailure?.failure ?? null,
-    });
-    logDiagnostics(diagnostics);
-    state = next;
-    saveState(stateFile, next);
-    logger.info?.(`zen-proxy: 一轮探测完成，公告 ${modelsWithVerdict(next, 'available').length} 个可用、`
-      + `${modelsWithVerdict(next, 'region').length} 个地区受限`);
-
-    const throttled = candidates.length > 0
-      && candidates.every((id) => {
-        const result = results[id];
-        if (result?.state !== PROBE_STATE.transient) return false;
-        const code = result.failure?.code;
-        return code === FAILURE_CODE.rateLimit || code === FAILURE_CODE.quota;
-      });
-    return { throttled, candidates };
+    catalog = { version: STATE_VERSION, updatedAt: Date.now(), models: candidates };
+    saveState(stateFile, catalog);
+    const regionCount = regionModelIds(config?.regionModels)
+      .filter((id) => candidates.includes(id)).length;
+    logger.info?.(`zen-proxy: 清单刷新完成，公告 ${candidates.length} 个免费模型`
+      + `（地区分组 ${regionCount} 个按配置指名）`);
+    return { candidates };
   }
 
   // ── 注册 ────────────────────────────────────────────────────────────────────
@@ -238,7 +201,7 @@ export function register(ctx, config, options = {}) {
     provider,
     displayName: ROUTE_LABELS[provider],
     settingsNs,
-    // 该车道没有可编辑的连接信息（凭据从配置 / 环境变量 / opencode auth.json 解析，
+    // 该车道没有可编辑的连接信息（凭据从配置 / 环境变量 / opencode 凭据库解析，
     // 地址写死在上游常量里）。
     settingsPath: [],
   })));
@@ -246,21 +209,21 @@ export function register(ctx, config, options = {}) {
   const scheduler = createScheduler({
     intervalMs: configuredIntervalMs,
     run: runRound,
-    onError: (error) => logger.warn?.(`zen-proxy: 探测轮次异常：${error?.message ?? error}`),
+    onError: (error) => logger.warn?.(`zen-proxy: 清单刷新轮次异常：${error?.message ?? error}`),
   });
 
   // 注册本身随 fiber 自动释放（宿主的 `registerAdapter` / `registerConfigurableProviders`
-  // 都把释放挂在各自的 effect 上），因此这里只需要管好探测循环的生命周期。
+  // 都把释放挂在各自的 effect 上），因此这里只需要管好刷新循环的生命周期。
   ctx.effect(() => {
     scheduler.start();
     return () => {
       scheduler.stop();
       controller.abort();
     };
-  }, 'zen-proxy: probe loop');
+  }, 'zen-proxy: listing loop');
 
-  if (Object.keys(state.models).length === 0) {
-    logger.info?.('zen-proxy: 本地没有历史探测结果，目录将在首轮探测完成后填充');
+  if (catalog.models.length === 0) {
+    logger.info?.('zen-proxy: 本地没有历史清单，目录将在首轮拉取完成后填充');
   }
 
   return { adapter, scheduler, runRound, stateFile, routes: [...ROUTES] };

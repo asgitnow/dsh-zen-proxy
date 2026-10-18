@@ -1,5 +1,5 @@
 /**
- * `src/register.js` 与入口 `index.js`：注册面、目录接线、卸载释放与源码卫生。
+ * `src/register.js` 与入口 `index.js`：注册面、清单驱动目录、区域分组、卸载释放与源码卫生。
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
@@ -83,18 +83,15 @@ function fakeContext({ settingsId = 'zen-proxy' } = {}) {
   };
 }
 
-/** 上游桩：清单 + 逐模型的探测/对话响应。 */
-function upstreamStub({ listing, framesByModel }) {
-  return fakeFetch((url, init) => {
+/** 上游桩：只服务清单（目录不做探测，这是唯一会被打到的上游端点）。 */
+function upstreamStub({ listing }) {
+  return fakeFetch((url) => {
     if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: listing.map((id) => ({ id, object: 'model' })) });
-    const model = init.body === undefined ? '' : JSON.parse(init.body).model;
-    const frames = framesByModel[model];
-    if (frames === undefined) return jsonResponse({ error: { type: 'server_error', message: 'no stub' } }, { status: 500 });
-    return sseResponse(frames);
+    throw new TypeError(`清单桩之外的请求: ${url}`);
   });
 }
 
-/** 一个永远失败的 fetch 桩：让 register 里自动发起的首轮探测不真的碰网络。 */
+/** 一个永远失败的 fetch 桩：让 register 里自动发起的首轮刷新不真的碰网络。 */
 const noNetwork = () => fakeFetch(() => { throw new TypeError('offline test'); }).fetch;
 
 const LISTING = [
@@ -103,11 +100,6 @@ const LISTING = [
   { id: 'nemotron-3.5-lightning-free' },
   { id: 'muse-spark-1.3-contributor-free' },
 ];
-
-const REGION_FRAME = JSON.stringify({
-  type: 'error',
-  error: { type: 'RegionError', message: 'This model is not available in your country.' },
-});
 
 describe('注册面', () => {
   it('以两条路由注册适配器，并声明两个可配置 provider', () => {
@@ -131,30 +123,27 @@ describe('注册面', () => {
     }
     assert.equal(entries[0].settingsNs, 'zen-proxy');
     assert.equal(handle.routes.length, 2);
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
   it('settingsNs 取宿主 fiber 的插件 id', () => {
     const ctx = fakeContext({ settingsId: 'custom-id' });
     register(ctx, { probeIntervalMinutes: 10 }, { stateFile: join(tempDir(), 'state.json'), fetchImpl: noNetwork() });
     assert.equal(ctx.directoryCalls[0][0].settingsNs, 'custom-id');
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
   it('probeIntervalMinutes 默认为 10', () => {
     const ctx = fakeContext();
     const handle = register(ctx, {}, { stateFile: join(tempDir(), 'state.json'), fetchImpl: noNetwork() });
     assert.equal(handle.scheduler.nextDelayMs, 10 * 60_000);
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
   it('运行中修改探测周期，下一轮起采用新值（无需重启进程）', async () => {
     const ctx = fakeContext();
     const config = { probeIntervalMinutes: 10 };
-    const { fetch } = upstreamStub({
-      listing: ['fledge-alpha-free'],
-      framesByModel: { 'fledge-alpha-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')] },
-    });
+    const { fetch } = upstreamStub({ listing: ['fledge-alpha-free'] });
     const handle = register(ctx, config, { stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch });
     assert.equal(handle.scheduler.nextDelayMs, 10 * 60_000);
 
@@ -162,7 +151,7 @@ describe('注册面', () => {
     await handle.runRound();
 
     assert.equal(handle.scheduler.nextDelayMs, 3 * 60_000, '重新武装时读取新周期');
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
   it('低于门槛的 OpenCode 版本被回退并记录诊断', () => {
@@ -173,17 +162,14 @@ describe('注册面', () => {
     });
     assert.ok(ctx.logger.lines.warn.some((line) => line.includes('1.17.0')));
     assert.ok(handle.adapter.providerInfo(ROUTE_MAIN).name.length > 0);
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
   it('卸载时停止探测并释放路由', async () => {
     const ctx = fakeContext();
-    const { fetch, calls } = upstreamStub({
-      listing: LISTING.map((entry) => entry.id),
-      framesByModel: { 'fledge-alpha-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')] },
-    });
+    const { fetch, calls } = upstreamStub({ listing: LISTING.map((entry) => entry.id) });
     register(ctx, { probeIntervalMinutes: 10 }, { stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch });
-    // 等首轮探测落定，再卸载。
+    // 等首轮清单拉取落定，再卸载。
     await new Promise((resolve) => setTimeout(resolve, 30));
     const before = calls.length;
     for (const entry of ctx.disposers) entry.disposer();
@@ -192,8 +178,8 @@ describe('注册面', () => {
   });
 });
 
-describe('一轮探测驱动目录', () => {
-  it('可用 → 主路由；地区受限 → 地区路由；付费模型被过滤', async () => {
+describe('一轮清单驱动目录', () => {
+  it('免费候选全部直接进目录；regionModels 指名的拆到地区路由；付费模型被过滤', async () => {
     const ctx = fakeContext();
     const listing = [
       'claude-fable-5',
@@ -203,47 +189,60 @@ describe('一轮探测驱动目录', () => {
       'exo-free',
       'jev-1.13-free',
     ];
-    const { fetch } = upstreamStub({
-      listing,
-      framesByModel: {
-        'fledge-alpha-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')],
-        'nemotron-3.5-lightning-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')],
-        'muse-spark-1.3-contributor-free': [REGION_FRAME],
-        'exo-free': [REGION_FRAME],
-        'jev-1.13-free': [REGION_FRAME],
-      },
-    });
-    const handle = register(ctx, { probeIntervalMinutes: 10 }, {
-      stateFile: join(tempDir(), 'state.json'),
-      fetchImpl: fetch,
-    });
+    const { fetch } = upstreamStub({ listing });
+    const handle = register(ctx, {
+      probeIntervalMinutes: 10,
+      regionModels: ['muse-spark-1.3-contributor-free', 'exo-free'],
+    }, { stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch });
     const outcome = await handle.runRound();
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
 
     assert.deepEqual(outcome.candidates, ['fledge-alpha-free', 'nemotron-3.5-lightning-free', 'muse-spark-1.3-contributor-free', 'exo-free', 'jev-1.13-free']);
     const adapter = ctx.adapterCalls[0].adapter;
-    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['fledge-alpha-free', 'nemotron-3.5-lightning-free']);
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), [
+      'fledge-alpha-free',
+      'nemotron-3.5-lightning-free',
+      'jev-1.13-free',
+    ]);
     assert.deepEqual(
       (await adapter.listModels(ROUTE_REGION)).map((model) => model.id),
-      ['muse-spark-1.3-contributor-free', 'exo-free', 'jev-1.13-free'],
+      ['muse-spark-1.3-contributor-free', 'exo-free'],
     );
     for (const provider of [ROUTE_MAIN, ROUTE_REGION]) {
       assert.equal((await adapter.listModels(provider)).some((model) => model.id === 'claude-fable-5'), false, '付费模型不得出现');
     }
   });
 
+  it('目录不做探测：一轮只打一次上游（清单）', async () => {
+    const ctx = fakeContext();
+    const { fetch, calls } = upstreamStub({ listing: ['a-free', 'b-free'] });
+    const handle = register(ctx, { probeIntervalMinutes: 10 }, {
+      stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch,
+    });
+    // register 挂载即自动跑首轮（fakeContext 的 effect 同步触发）+ 手动 runRound：
+    // 恰好两次清单请求，除此之外不得有任何上游请求（不逐模型探测）。
+    await handle.runRound();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
+
+    const adapter = ctx.adapterCalls[0].adapter;
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['a-free', 'b-free']);
+    // 对 zen 上游：自动首轮 + 手动一轮，各一次清单请求，除此之外不得有任何请求（无探测流量）。
+    // 对 models.dev 的能力表拉取是另一条线路（每进程一次），不在本断言范围。
+    const listingCalls = calls.filter((call) => call.url.endsWith('/zen/v1/models'));
+    assert.equal(listingCalls.length, 2, '自动首轮 + 手动一轮，各一次清单请求');
+    const probeTraffic = calls.filter((call) => call.url.includes('/zen/v1/') && !call.url.endsWith('/zen/v1/models'));
+    assert.deepEqual(probeTraffic, [], '不得有 chat/completions 或 responses 探测请求');
+  });
+
   it('没有可溯源元数据的免费模型仍进入目录，并记录一条诊断', async () => {
     const ctx = fakeContext();
-    const { fetch } = upstreamStub({
-      listing: ['jev-1.13-free'],
-      framesByModel: { 'jev-1.13-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')] },
-    });
+    const { fetch } = upstreamStub({ listing: ['jev-1.13-free'] });
     const handle = register(ctx, { probeIntervalMinutes: 10 }, {
       stateFile: join(tempDir(), 'state.json'),
       fetchImpl: fetch,
     });
     await handle.runRound();
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
 
     const adapter = ctx.adapterCalls[0].adapter;
     const ids = (await adapter.listModels(ROUTE_MAIN)).map((model) => model.id);
@@ -256,14 +255,11 @@ describe('一轮探测驱动目录', () => {
   it('清单拉取失败时本轮作废，既有目录保持不动', async () => {
     const ctx = fakeContext();
     const stateFile = join(tempDir(), 'state.json');
-    const good = upstreamStub({
-      listing: ['fledge-alpha-free'],
-      framesByModel: { 'fledge-alpha-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')] },
-    });
+    const good = upstreamStub({ listing: ['fledge-alpha-free'] });
     const first = register(ctx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: good.fetch });
     await first.runRound();
     assert.deepEqual((await ctx.adapterCalls[0].adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['fledge-alpha-free']);
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
 
     const secondCtx = fakeContext();
     const broken = fakeFetch(() => { throw new TypeError('fetch failed'); });
@@ -274,36 +270,30 @@ describe('一轮探测驱动目录', () => {
       ['fledge-alpha-free'],
       '一次拉取失败不得清空目录',
     );
-    secondCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    secondCtx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
-  it('全轮限流时退避，且持久化到传入的状态文件', async () => {
+  it('免费候选按新形状持久化到传入的状态文件', async () => {
     const ctx = fakeContext();
     const stateFile = join(tempDir(), 'state.json');
-    const limited = fakeFetch((url) => {
-      if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: [{ id: 'fledge-alpha-free', object: 'model' }] });
-      return jsonResponse({ error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' } }, { status: 429 });
-    });
-    const handle = register(ctx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: limited.fetch });
-    const outcome = await handle.runRound();
-    ctx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    const { fetch } = upstreamStub({ listing: ['fledge-alpha-free', 'beam-free'] });
+    const handle = register(ctx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: fetch });
+    await handle.runRound();
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
 
-    assert.equal(outcome.throttled, true);
-    assert.deepEqual((await ctx.adapterCalls[0].adapter.listModels(ROUTE_MAIN)), []);
     const persisted = JSON.parse(readFileSync(stateFile, 'utf8'));
-    assert.equal(persisted.models['fledge-alpha-free'].state, 'unavailable');
+    assert.equal(persisted.version, 2);
+    assert.deepEqual(persisted.models, ['fledge-alpha-free', 'beam-free']);
+    assert.ok(Number.isSafeInteger(persisted.updatedAt) && persisted.updatedAt > 0);
   });
 
-  it('跨重启保留上次判定：新实例在首轮完成前即反映旧结果', async () => {
+  it('跨重启保留上次清单：新实例在首轮完成前即反映旧目录', async () => {
     const stateFile = join(tempDir(), 'state.json');
     const first = fakeContext();
-    const stub = upstreamStub({
-      listing: ['fledge-alpha-free'],
-      framesByModel: { 'fledge-alpha-free': [chatFrame({ content: 'ok' }), chatFinishFrame('stop')] },
-    });
+    const stub = upstreamStub({ listing: ['fledge-alpha-free'] });
     const a = register(first, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: stub.fetch });
     await a.runRound();
-    first.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    first.disposers.find((entry) => entry.label.includes('listing')).disposer();
 
     const second = fakeContext();
     const broken = fakeFetch(() => { throw new TypeError('offline'); });
@@ -312,98 +302,75 @@ describe('一轮探测驱动目录', () => {
       (await second.adapterCalls[0].adapter.listModels(ROUTE_MAIN)).map((model) => model.id),
       ['fledge-alpha-free'],
     );
-    second.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    second.disposers.find((entry) => entry.label.includes('listing')).disposer();
+  });
+
+  it('regionModels 每轮现读：运行中改配置，下一轮分组即变', async () => {
+    const ctx = fakeContext();
+    const config = { probeIntervalMinutes: 10, regionModels: [] };
+    const { fetch } = upstreamStub({ listing: ['fledge-alpha-free', 'beam-free'] });
+    const handle = register(ctx, config, { stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch });
+    await handle.runRound();
+    const adapter = ctx.adapterCalls[0].adapter;
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['fledge-alpha-free', 'beam-free']);
+
+    config.regionModels = ['beam-free'];
+    await handle.runRound();
+    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), ['beam-free']);
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['fledge-alpha-free']);
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 });
 
 describe('区域中继', () => {
-  it('配置中继后，地区受限模型经中继探测恢复进主目录，并携带中继令牌', async () => {
-    const stateFile = join(tempDir(), 'relay-state.json');
-    // 第一轮（无中继）：muse-spark 判定为地区受限
-    const firstCtx = fakeContext();
-    const first = upstreamStub({
-      listing: ['muse-spark-1.3-contributor-free'],
-      framesByModel: { 'muse-spark-1.3-contributor-free': [REGION_FRAME] },
-    });
-    const handle = register(firstCtx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: first.fetch });
-    await handle.runRound();
-    firstCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
-    assert.deepEqual(
-      (await firstCtx.adapterCalls[0].adapter.listModels(ROUTE_REGION)).map((model) => model.id),
-      ['muse-spark-1.3-contributor-free'],
-    );
-
-    // 第二轮（配置中继）：中继侧给正常流 → 模型恢复进主目录，对话请求同走中继。
-    // muse-spark 走 responses 协议族，探测与对话都按 responses 事件返回。
-    const relayCalls = [];
+  it('regionModels 指名的模型对话经中继并携带令牌', async () => {
+    const ctx = fakeContext();
+    // muse-spark 走 responses 协议族，对话按 responses 事件返回。
     const okResponses = () => sseResponse([
       JSON.stringify({ type: 'response.output_text.delta', delta: 'ok' }),
       JSON.stringify({ type: 'response.completed' }),
     ]);
-    const second = fakeFetch((url, init) => {
-      if (url.includes('relay.example')) {
-        relayCalls.push({ url, token: init.headers['x-zen-relay-token'] });
-        return okResponses();
-      }
+    const { fetch, calls } = fakeFetch((url, init) => {
+      if (url.includes('relay.example')) return okResponses();
       if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: [{ id: 'muse-spark-1.3-contributor-free' }] });
-      return okResponses();
+      throw new TypeError(`清单桩之外的请求: ${url}`);
     });
-    const secondCtx = fakeContext();
-    const secondHandle = register(secondCtx, {
+    const handle = register(ctx, {
       probeIntervalMinutes: 10,
+      regionModels: ['muse-spark-1.3-contributor-free'],
       regionRelayUrl: 'https://relay.example',
       regionRelayToken: 'tok-1',
-    }, { stateFile, fetchImpl: second.fetch });
-    await secondHandle.runRound();
-    secondCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
+    }, { stateFile: join(tempDir(), 'state.json'), fetchImpl: fetch });
+    await handle.runRound();
 
-    // 调度器挂载即自动跑首轮，加上手动 runRound：中继探测可能发生多次，
-    // 只断言每一次的形状（地址与令牌）都正确。muse-spark 系走 responses 协议族。
-    assert.ok(relayCalls.length >= 1, '地区受限模型应经中继探测');
+    const adapter = ctx.adapterCalls[0].adapter;
+    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), ['muse-spark-1.3-contributor-free']);
+
+    const prepared = await adapter.prepareCall(ROUTE_REGION, 'muse-spark-1.3-contributor-free');
+    await collect(prepared.stream({
+      model: 'muse-spark-1.3-contributor-free',
+      sessionId: 'ses-x',
+      messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: '你好' }] }],
+    }));
+    const relayCalls = calls.filter((call) => call.url.includes('relay.example'));
+    assert.ok(relayCalls.length >= 1, '对话请求应命中中继');
     for (const call of relayCalls) {
       assert.match(call.url, /^https:\/\/relay\.example\/(?:chat\/completions|responses)$/);
-      assert.equal(call.token, 'tok-1');
+      assert.equal(call.init.headers['x-zen-relay-token'], 'tok-1');
     }
-    const adapter = secondCtx.adapterCalls[0].adapter;
-    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), ['muse-spark-1.3-contributor-free']);
-    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), []);
-
-    // 中继模型的真实对话请求也走中继（via: relay），并带同一令牌
-    const prepared = await adapter.prepareCall(ROUTE_MAIN, 'muse-spark-1.3-contributor-free');
-    await collect(prepared.stream({ sessionId: 'ses-x', messages: [{ id: 'm1', role: 'user', content: [{ type: 'text', text: '你好' }] }] }));
-    const last = relayCalls.at(-1);
-    assert.match(last.url, /^https:\/\/relay\.example\/(?:chat\/completions|responses)$/, '对话请求也应命中中继');
-    assert.equal(last.token, 'tok-1');
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
   });
 
-  it('中继探测仍返回 RegionError 时模型留在地区分组', async () => {
-    const stateFile = join(tempDir(), 'relay-state2.json');
-    const firstCtx = fakeContext();
-    const first = upstreamStub({
-      listing: ['muse-spark-1.3-contributor-free'],
-      framesByModel: { 'muse-spark-1.3-contributor-free': [REGION_FRAME] },
+  it('指名了 regionModels 但未配置中继时记录一条警告', async () => {
+    const ctx = fakeContext();
+    const { fetch } = upstreamStub({ listing: ['beam-free'] });
+    const handle = register(ctx, { probeIntervalMinutes: 10, regionModels: ['beam-free'] }, {
+      stateFile: join(tempDir(), 'state.json'),
+      fetchImpl: fetch,
     });
-    const handle = register(firstCtx, { probeIntervalMinutes: 10 }, { stateFile, fetchImpl: first.fetch });
     await handle.runRound();
-    firstCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
-
-    const secondCtx = fakeContext();
-    const second = fakeFetch((url) => {
-      if (url.includes('relay.example')) return sseResponse([REGION_FRAME]);
-      if (url.endsWith('/models')) return jsonResponse({ object: 'list', data: [{ id: 'muse-spark-1.3-contributor-free' }] });
-      return sseResponse([REGION_FRAME]);
-    });
-    const secondHandle = register(secondCtx, {
-      probeIntervalMinutes: 10,
-      regionRelayUrl: 'https://relay.example',
-      regionRelayToken: 'tok-1',
-    }, { stateFile, fetchImpl: second.fetch });
-    await secondHandle.runRound();
-    secondCtx.disposers.find((entry) => entry.label.includes('probe')).disposer();
-
-    const adapter = secondCtx.adapterCalls[0].adapter;
-    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), []);
-    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), ['muse-spark-1.3-contributor-free']);
+    ctx.disposers.find((entry) => entry.label.includes('listing')).disposer();
+    assert.ok(ctx.logger.lines.warn.some((line) => line.includes('regionModels') && line.includes('regionRelayUrl')));
   });
 });
 
@@ -456,11 +423,11 @@ describe('源码卫生', () => {
       }
     }
     // 计数型检查必须能回答「检查了几个对象」：正则若失效，上面的断言会全部落空而仍然通过。
-    // 阈值 39 是本机实测的**去重后**说明符数（`scripts/count-imports.mjs`：旧单正则不去重为 40，
-    // 差额来自 probe.js 中同一说明符出现两次）。它只兜住「整体扫不到东西」这一类失效；
+    // 阈值 32 是本机实测的**去重后**说明符数（`scripts/count-imports.mjs`；探测状态机
+    // 移除后 src/ 共 10 个模块）。它只兜住「整体扫不到东西」这一类失效；
     // 「漏抓某一种写法」由下面的对抗用例负责，两者分工不同。
     assert.ok(checked > 0, '未匹配到任何 import，检查逻辑可能已失效');
-    assert.ok(checked >= 39, `受检 import 数异常偏少：${checked}`);
+    assert.ok(checked >= 32, `受检 import 数异常偏少：${checked}`);
   });
 
   it('依赖检查的正则覆盖裸导入、模板字符串与 require', () => {

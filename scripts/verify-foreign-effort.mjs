@@ -7,11 +7,10 @@
  *   (b) 正常 UI 路径（客户端未指定档位）会落到本车道的 defaultEffort，不受影响。
  */
 import { createAdapter, ROUTE_MAIN } from '../src/adapter.js';
-import { MODEL_STATE } from '../src/state.js';
 
 const state = () => ({
-  version: 1, updatedAt: 0,
-  models: { 'mimo-v2.6-flash-free': { state: MODEL_STATE.available, transientStreak: 0 } },
+  version: 2, updatedAt: 0,
+  models: ['mimo-v2.6-flash-free'],
 });
 
 // 宿主规则（逐条抄自 dsh-llm/lib/index.js:2169-2194）

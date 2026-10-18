@@ -45,9 +45,9 @@ function report(label, result) {
 console.log('\n=== 基线（未变异）===');
 report('原始代码', runTests());
 
-// 变异 1：删掉 require 正则（第 4 条）
+// 变异 1：删掉 require 正则（第 4 条）。锚点不带行尾——工作副本可能是 CRLF。
 const mutRequire = original.replace(
-  "  /(?:^|[^\\w$.])require\\s*\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)/gm,\n",
+  "  /(?:^|[^\\w$.])require\\s*\\(\\s*['\"]([^'\"]+)['\"]\\s*\\)/gm,",
   '',
 );
 if (mutRequire === original) throw new Error('变异 1 未生效：找不到 require 正则那一行');

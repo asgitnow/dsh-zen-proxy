@@ -11,7 +11,7 @@ import {
   conversationIdentity,
   createAdapter,
 } from '../src/adapter.js';
-import { MODEL_STATE, emptyState } from '../src/state.js';
+import { emptyState } from '../src/state.js';
 import { resetCapabilities } from '../src/catalog.js';
 import { chatFinishFrame, chatFrame, collect, fakeFetch, sseResponse } from './fake-upstream.js';
 
@@ -96,21 +96,25 @@ function assertHostAcceptsCatalog(provider, models) {
   }
 }
 
-/** 造一个固定的判定状态。 */
+/** 造一个固定的目录状态（最近一次清单的免费 id 列表）。 */
 const stateOf = (models) => () => ({
-  version: 1,
+  version: 2,
   updatedAt: 0,
-  models: Object.fromEntries(Object.entries(models).map(([id, state]) => [id, { state, transientStreak: 0 }])),
+  models,
 });
 
-const mixedState = stateOf({
-  'fledge-alpha-free': MODEL_STATE.available,
-  'nemotron-3.5-lightning-free': MODEL_STATE.available,
-  'muse-spark-1.3-contributor-free': MODEL_STATE.region,
-  'muse-spark-1.2-contributor-free': MODEL_STATE.region,
-  'exo-free': MODEL_STATE.unavailable,
-  'jev-1.13-free': MODEL_STATE.unknown,
-});
+/** 主目录里的免费模型；muse-spark 两兄弟在配置里被指名为地区受限。 */
+const mixedState = stateOf([
+  'fledge-alpha-free',
+  'nemotron-3.5-lightning-free',
+  'muse-spark-1.3-contributor-free',
+  'muse-spark-1.2-contributor-free',
+  'exo-free',
+  'jev-1.13-free',
+]);
+
+/** 与 mixedState 搭配的 regionModels 配置。 */
+const mixedRegionModels = () => ['muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free'];
 
 /**
  * 与 `mixedState` 对应的能力表（取自 models.dev 的真实值）：
@@ -137,10 +141,15 @@ describe('providerInfo', () => {
 });
 
 describe('listModels', () => {
-  it('主路由只返回判定为可用的模型，且条目自洽', async () => {
-    const adapter = createAdapter({ state: mixedState });
+  it('主路由返回清单里未被配置指名的模型，且条目自洽', async () => {
+    const adapter = createAdapter({ state: mixedState, regionModels: mixedRegionModels });
     const models = await adapter.listModels(ROUTE_MAIN);
-    assert.deepEqual(models.map((model) => model.id), ['fledge-alpha-free', 'nemotron-3.5-lightning-free']);
+    assert.deepEqual(models.map((model) => model.id), [
+      'fledge-alpha-free',
+      'nemotron-3.5-lightning-free',
+      'exo-free',
+      'jev-1.13-free',
+    ]);
     const ids = new Set();
     for (const model of models) {
       assert.equal(model.provider, ROUTE_MAIN, 'provider 必须与该路由一致');
@@ -154,23 +163,28 @@ describe('listModels', () => {
     }
   });
 
-  it('地区路由只返回判定为地区受限的模型', async () => {
-    const adapter = createAdapter({ state: mixedState });
+  it('地区路由只返回配置 regionModels 指名的模型', async () => {
+    const adapter = createAdapter({ state: mixedState, regionModels: mixedRegionModels });
     const models = await adapter.listModels(ROUTE_REGION);
     assert.deepEqual(models.map((model) => model.id), ['muse-spark-1.3-contributor-free', 'muse-spark-1.2-contributor-free']);
     for (const model of models) assert.equal(model.provider, ROUTE_REGION);
   });
 
-  it('未知与不可用的模型两条路由都不出现', async () => {
+  it('未配置 regionModels 时地区路由为空、主路由收下全部', async () => {
     const adapter = createAdapter({ state: mixedState });
+    assert.deepEqual((await adapter.listModels(ROUTE_REGION)).map((model) => model.id), []);
+    assert.deepEqual((await adapter.listModels(ROUTE_MAIN)).map((model) => model.id), mixedState().models);
+  });
+
+  it('目录里没有的 id 两条路由都不出现', async () => {
+    const adapter = createAdapter({ state: mixedState, regionModels: mixedRegionModels });
     for (const provider of ROUTES) {
       const ids = (await adapter.listModels(provider)).map((model) => model.id);
-      assert.equal(ids.includes('exo-free'), false);
-      assert.equal(ids.includes('jev-1.13-free'), false);
+      assert.equal(ids.includes('not-in-listing-free'), false);
     }
   });
 
-  it('没有历史判定时目录为空且不抛错', async () => {
+  it('没有历史清单时目录为空且不抛错', async () => {
     const adapter = createAdapter({ state: emptyState });
     for (const provider of ROUTES) assert.deepEqual(await adapter.listModels(provider), []);
   });

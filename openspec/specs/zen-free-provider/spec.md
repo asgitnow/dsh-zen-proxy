@@ -1,7 +1,7 @@
 # zen-free-provider Specification
 
 ## Purpose
-向 dsh 暴露 OpenCode Zen 免费模型的 provider 路由与模型目录，使用户无需手工配置即可在模型选择器中直接使用可用免费模型，并让地区受限的免费模型以独立分组呈现。
+向 dsh 暴露 OpenCode Zen 免费模型的 provider 路由与模型目录，使用户无需手工配置即可在模型选择器中直接使用免费模型，并让地区受限的免费模型以独立分组呈现。
 
 ## Requirements
 
@@ -16,27 +16,39 @@
 - **WHEN** 插件被卸载
 - **THEN** `ctx.llm.listProviders()` 不再包含上述两个 id
 
-### Requirement: 目录只公布免费且可用的模型
-`opencode-free` 路由的目录 SHALL 只包含模型 id 以 `-free` 结尾、且最近一次探测判定为可用的模型；付费模型、判定不可用的模型与地区受限模型 SHALL NOT 出现在该目录中。
+### Requirement: 目录直接反映上游清单，不做可用性探测
+两条路由的目录 SHALL 由最近一次上游清单中的免费模型（id 以 `-free` 结尾）直接构成，SHALL NOT 对模型发起周期性可用性探测。付费模型 SHALL NOT 出现在任何路由的目录中。除清单拉取与用户对话外，插件 MUST NOT 产生指向 `/zen/v1/chat/completions` 或 `/zen/v1/responses` 的周期性请求。
 
 #### Scenario: 付费模型被过滤
 - **WHEN** 上游模型清单同时包含以 `-free` 结尾与不以 `-free` 结尾的 id
-- **THEN** `opencode-free` 路由的目录只包含以 `-free` 结尾的 id
+- **THEN** 两条路由的目录只包含以 `-free` 结尾的 id
 
-#### Scenario: 判定不可用的模型被过滤
-- **WHEN** 某个免费模型的最近一次探测失败
-- **THEN** 该模型不出现在 `opencode-free` 路由的目录中
+#### Scenario: 清单中的免费模型全部进目录
+- **WHEN** 一轮清单刷新完成且未配置地区分组
+- **THEN** 清单中的每个免费 id 都出现在 `opencode-free` 路由的目录中，不因任何探测结果被剔除
 
-#### Scenario: 尚未完成首次探测
-- **WHEN** 插件刚挂载且本地没有任何历史探测结果
+#### Scenario: 尚未完成首次刷新
+- **WHEN** 插件刚挂载且本地没有任何历史清单
 - **THEN** `opencode-free` 路由的目录不包含任何模型，且不抛出错误
 
-### Requirement: 地区受限模型独立分组
-地区受限的免费模型 SHALL 只出现在 `opencode-free-region` 路由的目录中。
+#### Scenario: 清单拉取失败不清空目录
+- **WHEN** 某一轮清单拉取失败
+- **THEN** 既有目录保持不动，等待下一轮刷新
 
-#### Scenario: 地区受限模型归入地区分组
-- **WHEN** 某个免费模型的探测结果为地区受限
+### Requirement: 地区分组由配置指名
+`regionModels` 配置 SHALL 决定哪些免费模型进入 `opencode-free-region` 路由：清单中 id 命中该配置的模型 SHALL 只出现在地区路由，其余 SHALL 只出现在 `opencode-free` 路由。配置 SHALL 每轮刷新时现读，修改后下一轮生效且无需重启。配置里指名了模型但未配置区域中继时，插件 SHALL 记录一条警告。
+
+#### Scenario: 指名模型归入地区分组
+- **WHEN** 某个免费模型 id 出现在 `regionModels` 配置中且存在于上游清单
 - **THEN** 该模型出现在 `opencode-free-region` 路由的目录中，且不出现在 `opencode-free` 路由的目录中
+
+#### Scenario: 指名但清单中不存在的模型无副作用
+- **WHEN** `regionModels` 指名的 id 不在最近一次清单里
+- **THEN** 该 id 不出现在任何路由的目录中，也不产生诊断
+
+#### Scenario: 运行中修改分组
+- **WHEN** 用户修改 `regionModels` 配置
+- **THEN** 下一轮清单刷新后分组按新配置生效，无需重启进程
 
 ### Requirement: 目录条目自洽
 适配器公布的每个模型条目 SHALL 携带与其所属路由一致的 `provider`、非空的 `id` 与非空的 `name`，且同一路由内 `id` MUST NOT 重复。
@@ -51,7 +63,9 @@
 
 `context.contextWindow` SHALL 取自 `limit.context`、输出容量 SHALL 取自 `limit.output`、输入模态 SHALL 取自 `modalities.input`，三者 SHALL 按 `baseModelId` 归一后的 id 透传。输入模态 SHALL 只声明宿主 `ModelModalityMap` 认识的值（`text`、`image`）：`modalities.input` 含 `image` 时声明 `['text', 'image']`，否则声明 `['text']`；上游另有的 `video`/`audio`/`pdf` SHALL 被忽略，因为它们没有对应的宿主内容块。能力表中没有条目的模型 SHALL 回退为 `['text']` 且省略 `context`，SHALL NOT 因元数据缺失而收缩目录。适配器 SHALL NOT 在精确模型信息中声明 `defaultMaxTokens`；请求体中的输出预算由 `zen-free-upstream-wire` 的「思考预算」需求约束。
 
-能力表拉取失败 SHALL 只降级、不致命：SHALL 省略 `context`、SHALL 按 `['text']` 声明输入模态、SHALL 记录 `CAPABILITIES_UNAVAILABLE`，且 SHALL NOT 中断清单获取与可用性探测。
+能力表拉取失败 SHALL 只降级、不致命：SHALL 省略 `context`、SHALL 按 `['text']` 声明输入模态、SHALL 记录 `CAPABILITIES_UNAVAILABLE`，且 SHALL NOT 中断清单获取。
+
+用户 SHALL 能通过配置面按模型基名覆盖/补全能力元数据（`capabilities` 配置），字段与 models.dev 条目同形，覆盖侧字段赢；配置 SHALL 每轮刷新时现读。SHALL NOT 为覆盖值新增专门的校验层——上下文窗口与输出容量的既有合法值检查（正整数）与输入模态的词汇表过滤就是唯一闸门。
 
 #### Scenario: 模型信息解析不因元数据缺失而失败
 
@@ -79,15 +93,15 @@
 - **THEN** 其 `inputModalities` 为 `['text']`，且结果中不出现宿主词汇表以外的模态值
 
 ### Requirement: 插件配置面
-插件 SHALL 通过 `registerConfigurableProviders` 声明其两个路由，并 SHALL 提供一个可编辑的探测周期配置项，默认值为 10 分钟。
+插件 SHALL 通过 `registerConfigurableProviders` 声明其两个路由，并 SHALL 提供可编辑的配置项：清单刷新周期（默认 10 分钟）、地区分组 `regionModels`（默认空数组）。
 
 #### Scenario: 配置条目可枚举
 - **WHEN** `ctx.llm.listConfigurableProviders()` 被调用
 - **THEN** 返回结果包含 provider 为 `opencode-free` 与 `opencode-free-region` 的两个条目，其 displayName 与 settingsNs 均非空
 
-#### Scenario: 探测周期可改
-- **WHEN** 用户把探测周期配置改为非默认值
-- **THEN** 后续探测按新周期调度，无需重启进程
+#### Scenario: 刷新周期可改
+- **WHEN** 用户把清单刷新周期配置改为非默认值
+- **THEN** 后续刷新按新周期调度，无需重启进程
 
 ### Requirement: 不写死用户目录路径
 插件 SHALL 通过宿主环境信息解析自身状态目录，并 MUST NOT 在源码中写死任何用户目录绝对路径；唯一允许写死的网络地址是上游 base URL。

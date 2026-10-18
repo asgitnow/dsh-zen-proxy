@@ -1,206 +1,103 @@
 /**
- * `src/state.js`：判定状态机与持久化。
+ * `src/state.js`：目录的持久化——上游清单里最近一次看到的免费模型 id 列表。
+ *
+ * 目录不做可用性判定（探测在免费车道上自耗配额），因此本文件只验证：
+ * 形状归一、v1 判定状态的迁移、原子保存与缺失容错。
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import os from 'node:os';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, describe, it } from 'node:test';
 
-import { PROBE_STATE } from '../src/probe.js';
 import {
-  DATA_DIR_NAME,
-  DIAGNOSTIC,
-  MODEL_STATE,
-  STATE_FILE_NAME,
   STATE_VERSION,
-  TRANSIENT_GRACE,
   emptyState,
   loadState,
-  modelsWithVerdict,
-  reduceRound,
   resolveStateDir,
   resolveStateFile,
   saveState,
-  verdictOf,
 } from '../src/state.js';
 
-const tempDirs = [];
-function tempDir() {
-  const dir = mkdtempSync(join(os.tmpdir(), 'zen-proxy-test-'));
-  tempDirs.push(dir);
-  return dir;
-}
-after(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
-});
+const TMP = mkdtempSync(join(tmpdir(), 'zen-state-'));
+after(() => rmSync(TMP, { recursive: true, force: true }));
 
-/** 造一个「上一轮已判定 available」的状态。 */
-const available = (id) => ({ version: 1, updatedAt: 0, models: { [id]: { state: 'available', transientStreak: 0 } } });
-
-describe('reduceRound', () => {
-  it('一次 503 之后模型仍留在主路由目录', () => {
-    const { state } = reduceRound(available('exo-free'), {
-      models: ['exo-free'],
-      results: { 'exo-free': { state: PROBE_STATE.transient, detail: '503' } },
-      now: 1,
+describe('src/state.js', () => {
+  describe('路径解析', () => {
+    it('默认 <home>/.dsh/zen-proxy/availability.json，DSH_HOME 优先', () => {
+      const env = { DSH_HOME: join(TMP, 'dsh-home') };
+      assert.equal(
+        resolveStateFile({ env }),
+        join(TMP, 'dsh-home', 'zen-proxy', 'availability.json'),
+      );
+      assert.equal(resolveStateDir({ env }), join(TMP, 'dsh-home', 'zen-proxy'));
+      const home = join(TMP, 'plain-home');
+      assert.equal(
+        resolveStateFile({ env: {}, home }),
+        join(home, '.dsh', 'zen-proxy', 'availability.json'),
+      );
     });
-    assert.equal(verdictOf(state, 'exo-free'), MODEL_STATE.available);
   });
 
-  it('连续三次瞬时故障后移出目录', () => {
-    assert.equal(TRANSIENT_GRACE, 3);
-    let state = available('exo-free');
-    const transient = { 'exo-free': { state: PROBE_STATE.transient, detail: '503' } };
-    for (let strike = 1; strike < TRANSIENT_GRACE; strike += 1) {
-      state = reduceRound(state, { models: ['exo-free'], results: transient, now: strike }).state;
-      assert.equal(verdictOf(state, 'exo-free'), MODEL_STATE.available, `第 ${strike} 次仍保留`);
-    }
-    const last = reduceRound(state, { models: ['exo-free'], results: transient, now: TRANSIENT_GRACE });
-    assert.equal(verdictOf(last.state, 'exo-free'), MODEL_STATE.unavailable);
-    assert.ok(last.diagnostics.some((entry) => entry.code === DIAGNOSTIC.graceExpired));
-  });
-
-  it('成功的探测把瞬时故障计数清零', () => {
-    let state = available('exo-free');
-    state = reduceRound(state, { models: ['exo-free'], results: { 'exo-free': { state: PROBE_STATE.transient } }, now: 1 }).state;
-    state = reduceRound(state, { models: ['exo-free'], results: { 'exo-free': { state: PROBE_STATE.available } }, now: 2 }).state;
-    assert.equal(state.models['exo-free'].transientStreak, 0);
-    state = reduceRound(state, { models: ['exo-free'], results: { 'exo-free': { state: PROBE_STATE.transient } }, now: 3 }).state;
-    assert.equal(verdictOf(state, 'exo-free'), MODEL_STATE.available);
-  });
-
-  it('429 不改变地区归属', () => {
-    const region = { version: 1, updatedAt: 0, models: { 'muse-spark-1.3-contributor-free': { state: 'region', transientStreak: 0 } } };
-    const { state } = reduceRound(region, {
-      models: ['muse-spark-1.3-contributor-free'],
-      results: { 'muse-spark-1.3-contributor-free': { state: PROBE_STATE.transient, detail: '429' } },
-      now: 1,
+  describe('目录形状', () => {
+    it('空状态：version 2、models 为空数组', () => {
+      const state = emptyState();
+      assert.equal(state.version, STATE_VERSION);
+      assert.equal(state.version, 2);
+      assert.deepEqual(state.models, []);
+      assert.equal(state.updatedAt, 0);
     });
-    assert.equal(verdictOf(state, 'muse-spark-1.3-contributor-free'), MODEL_STATE.region);
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.region), ['muse-spark-1.3-contributor-free']);
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.available), []);
-  });
 
-  it('地区判定只出现在地区路由', () => {
-    const { state } = reduceRound(emptyState(), {
-      models: ['a-free', 'b-free'],
-      results: {
-        'a-free': { state: PROBE_STATE.available },
-        'b-free': { state: PROBE_STATE.region, detail: 'RegionError' },
-      },
-      now: 1,
+    it('保存后读回：id 列表原样', () => {
+      const file = join(TMP, 'roundtrip.json');
+      const state = { version: STATE_VERSION, updatedAt: 42, models: ['a-free', 'b-free'] };
+      assert.equal(saveState(file, state), true);
+      const loaded = loadState(file);
+      assert.deepEqual(loaded.models, ['a-free', 'b-free']);
+      assert.equal(loaded.updatedAt, 42);
+      assert.equal(loaded.version, STATE_VERSION);
     });
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.available), ['a-free']);
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.region), ['b-free']);
-  });
 
-  it('全局失败把全部模型转 unknown', () => {
-    const { state, diagnostics } = reduceRound(emptyState(), {
-      models: ['a-free', 'b-free'],
-      results: { 'a-free': { state: PROBE_STATE.available }, 'b-free': { state: PROBE_STATE.region } },
-      pluginFailure: { message: 'OpenCode 1.18.0 or newer is required to use the free tier', upstreamType: 'UpgradeRequired', status: 426 },
-      now: 1,
+    it('保存用临时文件原子改名，不残留 .tmp', () => {
+      const file = join(TMP, 'atomic.json');
+      saveState(file, { version: STATE_VERSION, updatedAt: 1, models: ['x-free'] });
+      const leftovers = readdirSync(TMP).filter((name) => name.endsWith('.tmp'));
+      assert.deepEqual(leftovers, []);
+      assert.match(readFileSync(file, 'utf8'), /\n$/);
     });
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.available), []);
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.region), []);
-    assert.equal(verdictOf(state, 'a-free'), MODEL_STATE.unknown);
-    assert.equal(verdictOf(state, 'b-free'), MODEL_STATE.unknown);
-    assert.ok(diagnostics.some((entry) => entry.code === DIAGNOSTIC.identityRejected));
-  });
 
-  it('不可用与未知都不进入任何路由', () => {
-    const { state } = reduceRound(emptyState(), {
-      models: ['a-free', 'b-free'],
-      results: {
-        'a-free': { state: PROBE_STATE.unavailable, detail: 'ModelError' },
-        'b-free': { state: PROBE_STATE.unknown, detail: '401' },
-      },
-      now: 1,
+    it('文件缺失 / 非法 JSON / 非对象 → 空状态，不抛', () => {
+      assert.deepEqual(loadState(join(TMP, 'nope.json')), emptyState());
+      const broken = join(TMP, 'broken.json');
+      writeFileSync(broken, '{not json');
+      assert.deepEqual(loadState(broken), emptyState());
+      const notObject = join(TMP, 'array.json');
+      writeFileSync(notObject, '[1,2]');
+      assert.deepEqual(loadState(notObject), emptyState());
     });
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.available), []);
-    assert.deepEqual(modelsWithVerdict(state, MODEL_STATE.region), []);
-  });
 
-  it('本轮没有结果的模型保留原判定', () => {
-    const { state } = reduceRound(available('keep-free'), { models: ['new-free'], results: {}, now: 1 });
-    assert.equal(verdictOf(state, 'keep-free'), MODEL_STATE.available);
-    assert.equal(verdictOf(state, 'new-free'), MODEL_STATE.unknown);
-  });
-
-  it('中继探测的可用判定记 via: relay，直连探测会把它抹掉', () => {
-    const relayed = reduceRound(emptyState(), {
-      models: ['r-free', 'd-free'],
-      results: {
-        'r-free': { state: PROBE_STATE.available, via: 'relay' },
-        'd-free': { state: PROBE_STATE.available },
-      },
-      now: 1,
+    it('models 含非字符串或空串项时被过滤，重复项去重', () => {
+      const file = join(TMP, 'dirty.json');
+      writeFileSync(file, JSON.stringify({
+        version: 2, updatedAt: 7, models: ['a-free', '', 3, 'a-free', 'b-free'],
+      }));
+      assert.deepEqual(loadState(file).models, ['a-free', 'b-free']);
     });
-    assert.equal(relayed.state.models['r-free'].via, 'relay');
-    assert.equal(relayed.state.models['d-free'].via, undefined);
-    assert.deepEqual(modelsWithVerdict(relayed.state, MODEL_STATE.available), ['r-free', 'd-free'],
-      '经中继恢复的模型与直连模型同住主目录');
 
-    // 中继撤掉后改直连探测：via 应被清除
-    const backToDirect = reduceRound(relayed.state, {
-      models: ['r-free'],
-      results: { 'r-free': { state: PROBE_STATE.region } },
-      now: 2,
+    it('v1 判定状态迁移：钥匙即 id 列表（重启后目录不空）', () => {
+      const file = join(TMP, 'v1.json');
+      writeFileSync(file, JSON.stringify({
+        version: 1,
+        updatedAt: 1792290342769,
+        models: {
+          'beam-free': { state: 'region', transientStreak: 1 },
+          'mimo-v2.6-flash-free': { state: 'unknown', transientStreak: 2 },
+        },
+      }));
+      const loaded = loadState(file);
+      assert.equal(loaded.version, STATE_VERSION);
+      assert.equal(loaded.updatedAt, 1792290342769);
+      assert.deepEqual(loaded.models, ['beam-free', 'mimo-v2.6-flash-free']);
     });
-    assert.equal(backToDirect.state.models['r-free'].via, undefined);
-    assert.equal(verdictOf(backToDirect.state, 'r-free'), MODEL_STATE.region);
-  });
-});
-
-describe('持久化', () => {
-  it('写入后重新加载可读回', () => {
-    const file = join(tempDir(), STATE_FILE_NAME);
-    const next = reduceRound(emptyState(), {
-      models: ['exo-free'],
-      results: { 'exo-free': { state: PROBE_STATE.available } },
-      now: 42,
-    }).state;
-    assert.equal(saveState(file, next), true);
-    assert.deepEqual(loadState(file), next);
-  });
-
-  it('文件缺失、被截断或含非法 JSON 时按无历史处理且不抛错', () => {
-    const dir = tempDir();
-    assert.deepEqual(loadState(join(dir, 'missing.json')), emptyState());
-
-    const truncated = join(dir, 'truncated.json');
-    writeFileSync(truncated, '{"version":1,"models":{"a-f', 'utf8');
-    assert.deepEqual(loadState(truncated), emptyState());
-
-    const wrongShape = join(dir, 'shape.json');
-    writeFileSync(wrongShape, JSON.stringify({ version: 99, models: 'nope' }), 'utf8');
-    assert.deepEqual(loadState(wrongShape), emptyState());
-  });
-
-  it('忽略状态里形状非法的条目', () => {
-    const file = join(tempDir(), STATE_FILE_NAME);
-    writeFileSync(file, JSON.stringify({
-      version: 1,
-      updatedAt: 7,
-      models: {
-        'good-free': { state: 'available', transientStreak: 0 },
-        'bad-free': { state: 'nonsense' },
-        'worse-free': 3,
-      },
-    }), 'utf8');
-    const state = loadState(file);
-    assert.deepEqual(Object.keys(state.models), ['good-free']);
-    assert.equal(state.updatedAt, 7);
-    assert.equal(state.version, STATE_VERSION);
-  });
-
-  it('写入路径来自环境解析而非字面量', () => {
-    const fromEnv = resolveStateDir({ env: { DSH_HOME: join(os.tmpdir(), 'dsh-home') }, home: join(os.tmpdir(), 'ignored') });
-    assert.equal(fromEnv, join(os.tmpdir(), 'dsh-home', DATA_DIR_NAME));
-    const fromHome = resolveStateDir({ env: {}, home: join(os.tmpdir(), 'someone') });
-    assert.equal(fromHome, join(os.tmpdir(), 'someone', '.dsh', DATA_DIR_NAME));
-    assert.equal(resolveStateFile({ env: { DSH_HOME: join(os.tmpdir(), 'dsh-home') } }), join(fromEnv, STATE_FILE_NAME));
-    assert.equal(resolveStateFile({ stateDir: join(os.tmpdir(), 'explicit') }), join(os.tmpdir(), 'explicit', STATE_FILE_NAME));
   });
 });

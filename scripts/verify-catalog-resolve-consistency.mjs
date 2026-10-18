@@ -4,20 +4,17 @@
  * 都能解析出合法菜单，且不会因缺元数据而抛错。
  */
 import { createAdapter, ROUTES, ROUTE_MAIN, ROUTE_REGION } from '../src/adapter.js';
-import { MODEL_STATE } from '../src/state.js';
 
 const state = () => ({
-  version: 1,
+  version: 2,
   updatedAt: 0,
-  models: Object.fromEntries(
-    [
-      'exo-free', 'fledge-alpha-free', 'ling-3.0-flash-fin-free', 'ling-3.1-flash-free',
-      'longcat-2.5-preview-free', 'mimo-v2.6-flash-free',
-      'muse-spark-1.2-contributor-free', 'muse-spark-1.3-contributor-free',
-      'nemotron-3.5-lightning-free', 'nemotron-3-ultra-free', 'space-bunny-free',
-      'jev-1.13-free',
-    ].map((id) => [id, { state: MODEL_STATE.available, transientStreak: 0 }]),
-  ),
+  models: [
+    'exo-free', 'fledge-alpha-free', 'ling-3.0-flash-fin-free', 'ling-3.1-flash-free',
+    'longcat-2.5-preview-free', 'mimo-v2.6-flash-free',
+    'muse-spark-1.2-contributor-free', 'muse-spark-1.3-contributor-free',
+    'nemotron-3.5-lightning-free', 'nemotron-3-ultra-free', 'space-bunny-free',
+    'jev-1.13-free',
+  ],
 });
 
 const adapter = createAdapter({ state });

@@ -5,8 +5,11 @@
  * `normalizeModelInfo` 都没有「不可用」字段（已查证宿主契约），GUI 按 provider 分组，
  * 因此分组只能由路由表达（design D2）：
  *
- * - `opencode-free`：最近一次探测判定为 `available` 的免费模型；
- * - `opencode-free-region`：判定为 `region`（地区受限）的免费模型。
+ * - `opencode-free`：上游清单里的免费模型（配置 `regionModels` 指名者除外）；
+ * - `opencode-free-region`：配置 `regionModels` 指名的免费模型（地区受限）。
+ *
+ * 目录**不做可用性判定**：探测在免费车道上自耗按会话计的配额（实测把自己打到 429），
+ * 因此目录直接反映上游清单，请求失败由请求路径自己暴露。
  *
  * 本模块**结构性地**实现宿主的 `LlmAdapter` 六个可覆写点
  * （`providerInfo` / `providerRetryPolicy` / `imageRequestPricing` / `listModels` /
@@ -32,13 +35,12 @@ import { buildIdentityHeaders, requestForTurn, resolveClientVersion, sessionForC
 import { buildRequestFor, imageRefsOf } from './messages.js';
 import { translateChatStream } from './chat.js';
 import { translateResponsesStream } from './responses.js';
-import { MODEL_STATE, modelsWithVerdict, viaOf } from './state.js';
 import { applyToolQuartet } from './tools.js';
 
-/** 主路由：判定为可用的免费模型。 */
+/** 主路由：上游清单里的免费模型（配置指名的地区受限者除外）。 */
 export const ROUTE_MAIN = 'opencode-free';
 
-/** 地区路由：判定为地区受限的免费模型，以独立分组呈现。 */
+/** 地区路由：配置 `regionModels` 指名的免费模型，以独立分组呈现。 */
 export const ROUTE_REGION = 'opencode-free-region';
 
 /** 两条路由的展示名。 */
@@ -49,12 +51,6 @@ export const ROUTE_LABELS = Object.freeze({
 
 /** 注册顺序即 GUI 中的出现顺序。 */
 export const ROUTES = Object.freeze([ROUTE_MAIN, ROUTE_REGION]);
-
-/** 每个路由公布哪些判定状态。 */
-export const ROUTE_VERDICTS = Object.freeze({
-  [ROUTE_MAIN]: MODEL_STATE.available,
-  [ROUTE_REGION]: MODEL_STATE.region,
-});
 
 /**
  * 某模型的思考强度菜单。
@@ -89,17 +85,23 @@ export function conversationIdentity(options) {
 /**
  * 创建一个适配器实例。
  * @param {{state: () => object, clientVersion?: string, apiKey?: () => Promise<string | undefined>,
- *          regionRelay?: {url: string, token: string}, fetchImpl?: typeof fetch,
- *          attachments?: object, timeoutMs?: number}} deps
- *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）；
+ *          regionModels?: () => string[], regionRelay?: {url: string, token: string},
+ *          fetchImpl?: typeof fetch, attachments?: object, timeoutMs?: number}} deps
+ *   `state` 返回最近一次清单（`{models: string[]}`，由 `src/state.js` 持久化）；
  *   `apiKey` 是凭据取值函数（见 `src/credentials.js`）：**每个请求现调一次**，
  *   换号重登或配置改 key 后立即生效，不持有注册时的旧值；
- *   `regionRelay` 是区域中继（可选）：判定路径为 `relay` 的模型经它收发；
+ *   `regionModels` 返回配置里指名的地区受限模型 id（每请求现读，改配置即生效）；
+ *   `regionRelay` 是区域中继（可选）：region 组的模型经它收发；
  *   `attachments` 是宿主的 attachment 服务（可选）：图片字节由它按请求尺寸生成。
  * @returns {object} 六点齐全的适配器
  */
-export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetchImpl, timeoutMs, attachments }) {
+export function createAdapter({ state, clientVersion, apiKey, regionModels, regionRelay, fetchImpl, timeoutMs, attachments }) {
   const version = clientVersion ?? resolveClientVersion().version;
+
+  /** 配置指名的地区受限集合（现读，改配置即生效）。 */
+  function regionSet() {
+    return new Set(Array.isArray(regionModels?.()) ? regionModels() : []);
+  }
 
   function modelEntry(provider, modelId) {
     const contextWindow = contextWindowFor(modelId);
@@ -151,14 +153,18 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
     },
 
     /**
-     * 公布一个路由的目录。条目只受「免费 + 判定」驱动，与能力元数据完整度无关。
+     * 公布一个路由的目录：上游清单里的免费模型，按配置的 region 分组拆到两条路由。
      * @param {string} provider
      * @returns {object[]}
      */
     listModels(provider) {
-      const verdict = ROUTE_VERDICTS[provider];
-      if (verdict === undefined) return [];
-      return modelsWithVerdict(state(), verdict).map((modelId) => ({
+      if (provider !== ROUTE_MAIN && provider !== ROUTE_REGION) return [];
+      const models = Array.isArray(state()?.models) ? state().models : [];
+      const region = regionSet();
+      const ids = provider === ROUTE_REGION
+        ? models.filter((id) => region.has(id))
+        : models.filter((id) => !region.has(id));
+      return ids.map((modelId) => ({
         provider,
         id: modelId,
         name: displayNameFor(modelId),
@@ -194,7 +200,7 @@ export function createAdapter({ state, clientVersion, apiKey, regionRelay, fetch
       const resolved = this.resolveModel(provider, model);
       return {
         model: resolved,
-        stream: (options) => streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs, attachments }),
+        stream: (options) => streamTurn(options, { version, apiKey, regionModels, regionRelay, fetchImpl, timeoutMs, attachments }),
       };
     },
   };
@@ -236,12 +242,12 @@ async function resolveImages(messages, attachments, signal) {
  * 失败以「抛出带 `code` 与 `failure` 自有属性的 Error」交付；宿主会把它转成终止失败
  * 分片。取消则本流自己产出一个 `{kind:'aborted'}` 的终止 `finish`。
  * @param {object} options 宿主的 `GenerateOptions`
- * @param {{version: string, apiKey?: string, regionRelay?: {url: string, token: string},
- *          state: () => object, fetchImpl?: typeof fetch, timeoutMs?: number,
+ * @param {{version: string, apiKey?: () => Promise<string | undefined>, regionModels?: () => string[],
+ *          regionRelay?: {url: string, token: string}, fetchImpl?: typeof fetch, timeoutMs?: number,
  *          attachments?: object}} context
  * @returns {AsyncGenerator<object>}
  */
-async function* streamTurn(options, { version, apiKey, regionRelay, state, fetchImpl, timeoutMs, attachments }) {
+async function* streamTurn(options, { version, apiKey, regionModels, regionRelay, fetchImpl, timeoutMs, attachments }) {
   const modelId = String(options?.model ?? '');
   const signal = options?.signal;
   if (signal?.aborted === true) {
@@ -275,8 +281,8 @@ async function* streamTurn(options, { version, apiKey, regionRelay, state, fetch
     stop: options?.stop,
   });
   const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey: bearer });
-  // 判定路径为 relay 的模型（区域受限、经中继恢复可用）经同一中继收发。
-  const viaRelay = regionRelay !== undefined && viaOf(state(), modelId) === 'relay';
+  // 配置指名的地区受限模型经中继收发（现读配置，改了即生效）。
+  const viaRelay = regionRelay !== undefined && (regionModels?.() ?? []).includes(modelId);
   if (viaRelay) {
     headers['x-zen-relay-token'] = regionRelay.token;
   }

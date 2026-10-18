@@ -3,9 +3,10 @@
  *
  * 插件以官方 OpenCode 客户端的网络身份向上游发请求（2026-10 实测的闸门要求：
  * 官方算法生成的 session id、工具数组里带 `read` 工具且每个工具 parameters 非空、
- * 真实 API key——匿名 `Bearer public` 车道已关闭），每 10 分钟探测一次可用性，
- * 并把目录只交给「最近一次判定为可用」的免费模型；地区受限的免费模型进入
- * 独立路由 `opencode-free-region`。
+ * 真实 API key——匿名 `Bearer public` 车道已关闭），每 10 分钟刷新一次模型清单，
+ * 免费模型**直接进目录**（不做可用性探测：免费配额按会话计，周期探测会自耗配额，
+ * 实测把自己打到 429）；地区分组由配置 `regionModels` 指名，进入独立路由
+ * `opencode-free-region` 并经区域中继收发。
  *
  * 这里只做薄入口：`name` / `inject` / `Config` / `apply`。接线在 `src/register.js`，
  * 宿主无关的纯逻辑在 `src/` 的其余模块里。
@@ -30,7 +31,7 @@ export const inject = ['llm'];
 
 /** 配置面。 */
 export const Config = z.object({
-  /** 探测周期（分钟），默认 10。 */
+  /** 清单刷新周期（分钟），默认 10。 */
   probeIntervalMinutes: z.number().default(DEFAULT_PROBE_INTERVAL_MINUTES),
   /**
    * 伪装用的 OpenCode 版本。只在下限之上生效：低于闸门门槛 `1.18.0` 的值不会被使用，
@@ -46,12 +47,18 @@ export const Config = z.object({
   /**
    * 能力覆盖（可选）：按模型基名（baseModelId）覆盖/补全能力元数据，字段与
    * models.dev 条目同形，如 `{"jev-1.13-free": {"limit": {"context": 262144}}}`。
-   * 覆盖侧字段赢，每轮从配置现读，改完下一轮探测生效。
+   * 覆盖侧字段赢，每轮从配置现读，改完下一轮生效。
    */
   capabilities: z.any().default({}),
   /**
+   * 地区分组（可选）：指名哪些免费模型按「地区受限」呈现并经区域中继收发，
+   * 如 `["beam-free"]`。目录不做探测，分组完全由本配置决定；每轮现读，
+   * 改完下一轮生效。
+   */
+  regionModels: z.array(z.string()).default([]),
+  /**
    * 区域中继地址（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md）。
-   * 配置后，判定为地区受限的模型改经它探测与对话；中继探测可用即进主目录。
+   * 配置后，regionModels 指名的模型经它对话。
    */
   regionRelayUrl: z.string().default(''),
   /** 区域中继的访问令牌，须与 Worker 部署时的 `RELAY_TOKEN` secret 一致。 */
@@ -62,7 +69,7 @@ export const Config = z.object({
  * 挂载插件。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{probeIntervalMinutes: number, opencodeVersion: string, apiKey?: string,
- *          capabilities?: Record<string, object>,
+ *          capabilities?: Record<string, object>, regionModels?: string[],
  *          regionRelayUrl?: string, regionRelayToken?: string}} config
  */
 export function apply(ctx, config) {
