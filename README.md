@@ -11,9 +11,11 @@
 > 校验，8 月版的六头伪装已全部失效（`403 FreeTierError`，模型目录恒为空）。现在的要求：
 >
 > 1. **必须携带真实 API key**——`Bearer public` 匿名车道已关闭。插件按
->    配置 `apiKey` → 环境变量 `OPENCODE_API_KEY` → opencode 客户端的
->    `~/.local/share/opencode/auth.json`（登录过 `opencode auth login` 即有）解析；
->    三处都没有时探测失败并在日志里给出明确指引。
+>    配置 `apiKey` → 环境变量 `OPENCODE_API_KEY` → opencode 凭据库
+>    `~/.local/share/opencode/opencode.db` 的 `credential` 表（CLI 里登录过即有；
+>    新版 opencode 登录存的是 oauth `access` token，直接当 `Bearer` 用，
+>    随重登/令牌轮换自动更新）→ 旧版 `auth.json` 的顺序解析，**每轮与每个请求现读**，
+>    换号重登后不用重启；都没有时探测失败并在日志里给出明确指引。
 > 2. **session id 必须按官方算法生成**（时间戳 + 随机后缀，出现在四个 session 头里），
 >    sha256 派生的会话 id 一律被拒。
 > 3. **工具数组必须包含名为 `read` 的工具，且每个工具 `parameters.properties` 非空**
@@ -111,13 +113,26 @@ profile 的 `node_modules` 里，因此它们只作为本包的 `peerDependencie
 
 ## 配置
 
-插件有三个配置项（探测周期、伪装版本号、凭据）：
+插件有五个配置项：
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `probeIntervalMinutes` | `10` | 探测周期（分钟）。运行中修改后，**下一轮**起生效，无需重启进程。 |
 | `opencodeVersion` | `2.0.24` | 伪装用的 OpenCode 版本（拼进四段式 UA）。低于 `1.18.0` 的值不会被使用，插件会记录一条诊断并回退到门槛值。当前闸门不校验 UA。 |
-| `apiKey` | `''`（空） | 免费车道凭据。留空时按 `OPENCODE_API_KEY` 环境变量 → opencode 客户端的 `auth.json` 解析；三处都为空时探测失败并记录诊断。 |
+| `apiKey` | `''`（空） | 免费车道凭据。留空时按 `OPENCODE_API_KEY` 环境变量 → opencode 凭据库 `opencode.db`（CLI 登录过即有）→ 旧版 `auth.json` 解析。每轮与每个请求现读，换号重登或改配置后即生效，无需重启。 |
+| `capabilities` | `{}`（空） | 能力覆盖：按模型基名覆盖/补全能力元数据，字段与 models.dev 条目同形（`limit.context` / `limit.output` / `modalities.input`），覆盖侧字段赢。用于修正上游数据或补全 models.dev 缺失的模型（如 `jev-1.13-free`）。每轮从配置现读，改完下一轮生效。 |
+| `regionRelayUrl` / `regionRelayToken` | `''`（空） | 区域中继（可选）：部署在非受限出口的转发 Worker 与其令牌。配置后，判定为地区受限的模型改经它探测与对话。 |
+
+`capabilities` 示例（cordis.patch.yml）：
+
+```yaml
+- id: zen-proxy
+  config:
+    capabilities:
+      jev-1.13-free:
+        limit: { context: 262144, output: 32768 }
+        modalities: { input: [text, image] }
+```
 
 ---
 

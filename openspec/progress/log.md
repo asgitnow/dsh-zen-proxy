@@ -560,3 +560,46 @@ models.dev 自身的 `-free` 条目（42 个，`jev` 不在其中），没有与
 换成 512×512 真实图片后同一条路径 3/3 成功。**用一个非法输入推出的能力结论是无效的**；
 判定「不支持」至少要用一个合法样本证伪。
 
+---
+
+## 2026-10-18 — 凭据源跟进 opencode SQLite 化 + 能力可由配置覆盖
+
+### 交付
+
+- **凭据解析重写（`src/credentials.js`）**。新版 opencode 换号重登后凭据不再写
+  `auth.json`，而是落 SQLite `opencode.db` 的 `credential` 表（oauth 存 `access` token）。
+  解析顺序改为：配置 `apiKey` → `OPENCODE_API_KEY` → `opencode.db`（`node:sqlite`
+  只读打开，oauth 取 `access`、key 取 `key`，多行取 `active=1`）→ 旧版 `auth.json`。
+  与 opencode 官方实现（`packages/core/src/model-resolver.ts:308-328`）核实：推理请求
+  就是把 oauth `access` 直接当 provider `apiKey` 发 `Bearer`，无换 key 步骤。
+- **删除「解析一次全程复用」**。原先 `register.js` 在注册时解析一次闭包捕获，
+  `credentials.js` 还有模块级缓存——两层叠加导致换 key 必须重启。现改为每轮现解析、
+  适配器每请求现调 getter；换号重登或改配置后下一轮（乃至下一个请求）即生效。
+- **能力可由配置覆盖（`src/catalog.js` + `index.js` 的 `capabilities` 字段）**。
+  按模型基名与 models.dev 条目同形浅合并（`limit.context` / `limit.output` /
+  `modalities.input`），覆盖侧字段赢；models.dev 缺失的模型（`jev-1.13-free`）
+  可只靠覆盖拿全元数据。每轮从 config 现读，改完下一轮生效。非法覆盖值由既有的
+  合法值检查自然忽略，不新增校验层。
+- 测试 **203/203**（56 suites，新增 `credentials.test.js` 14 例：优先级、oauth/key
+  归一、active 行选择、无缓存、库缺失/损坏回退）。
+- 实测：从真库现读新凭据（`st_…`）→ 上游 `GET /models` 返回 **200**（改前 403）、
+  44 个模型、免费 9 个原样。
+
+### 教训 28：凭据源必须跟着宿主/官方客户端的实现走，它搬家是静默的
+
+opencode 换代后凭据从 `auth.json` 搬进 SQLite（`credential` 表），旧文件留在原地
+当墓碑（mtime 还是 7 月）。插件的解析路径没跟，用户重登后新凭据根本不在插件读的
+地方，表现却是「密钥无效」——看起来像配置问题，实际是**凭据源失效**。定位手段是
+对着官方源码找「它现在怎么存、怎么发」：`credential` 表结构、`credentialHeaders`
+的 `Bearer ${access}`、`nativeCredentialSettings` 的 `{apiKey: access}`，三级证据
+闭环后才动手。**凡是从外部程序「顺带」读的状态，升级后第一件事是核实存储位置没变。**
+
+### 教训 29：「解析一次全程复用」是拿可用性换便利的坏交易
+
+密钥在注册时解析一次、闭包捕获、全程复用，省下的只是每次读一个小文件——换来的是
+「换 key 必须重启」且用户完全看不出来为什么。探测周期同一份代码里就做对了
+（每轮从 config 现读），唯独凭据是死的，这种不一致本身就是设计缺陷的信号。
+修法很便宜：删缓存 + 每请求 getter，SQLite 只读打开与运行中的 opencode 共存无冲突。
+**凡是「只解析一次」的假设，都要回答：它变更是不是常态？** 凭据、配置、能力表——
+答案几乎总是「是」。
+

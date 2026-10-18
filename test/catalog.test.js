@@ -24,6 +24,7 @@ import {
   pathForModel,
   pathForWire,
   resetCapabilities,
+  setCapabilityOverrides,
   wireFor,
 } from '../src/catalog.js';
 
@@ -174,6 +175,59 @@ describe('能力元数据（运行时取自 models.dev 并透传）', () => {
 
   it('诊断码是稳定字符串', () => {
     assert.equal(CATALOG_METADATA_UNKNOWN, 'CATALOG_METADATA_UNKNOWN');
+  });
+});
+
+describe('能力覆盖（插件配置 capabilities，优先于 models.dev）', () => {
+  const MODELS = {
+    'fledge-alpha-free': { limit: { context: 1048576, output: 131072 }, modalities: { input: ['text', 'image'] } },
+  };
+
+  it('覆盖字段赢，未覆盖字段保持透传', async () => {
+    await seed(MODELS);
+    setCapabilityOverrides({
+      'fledge-alpha-free': { limit: { context: 4096 } },
+    });
+    assert.equal(contextWindowFor('fledge-alpha-free'), 4096);
+    assert.equal(outputLimitFor('fledge-alpha-free'), 131072, '未覆盖的 output 仍来自 models.dev');
+    assert.deepEqual(inputModalitiesFor('fledge-alpha-free'), ['text', 'image']);
+  });
+
+  it('models.dev 没有的模型可以只靠覆盖拿全元数据（jev-1.13-free 形态）', async () => {
+    await seed(MODELS);
+    setCapabilityOverrides({
+      'jev-1.13-free': { limit: { context: 262144, output: 32768 }, modalities: { input: ['text', 'image'] } },
+    });
+    assert.equal(contextWindowFor('jev-1.13-free'), 262144);
+    assert.equal(outputLimitFor('jev-1.13-free'), 32768);
+    assert.deepEqual(inputModalitiesFor('jev-1.13-free'), ['text', 'image']);
+    assert.equal(acceptsImage('jev-1.13-free'), true);
+    assert.equal(hasTraceableCapabilities('jev-1.13-free'), true);
+  });
+
+  it('每轮重设：传 undefined 清空覆盖，回到纯透传', async () => {
+    await seed(MODELS);
+    setCapabilityOverrides({ 'fledge-alpha-free': { limit: { context: 4096 } } });
+    assert.equal(contextWindowFor('fledge-alpha-free'), 4096);
+    setCapabilityOverrides(undefined);
+    assert.equal(contextWindowFor('fledge-alpha-free'), 1048576);
+  });
+
+  it('非法覆盖值被既有的合法值检查忽略，不抛错', async () => {
+    await seed(MODELS);
+    setCapabilityOverrides({
+      'fledge-alpha-free': { limit: { context: -1, output: 'lots' }, modalities: { input: ['video'] } },
+    });
+    // -1 与 'lots' 不是正整数 → 既有的守卫把它们当作无值；input 里没有 image → 纯文本。
+    assert.equal(contextWindowFor('fledge-alpha-free'), undefined);
+    assert.equal(outputLimitFor('fledge-alpha-free'), undefined);
+    assert.deepEqual(inputModalitiesFor('fledge-alpha-free'), ['text']);
+  });
+
+  it('占位形 id 走 baseModelId 归一后命中覆盖', async () => {
+    await seed(MODELS);
+    setCapabilityOverrides({ 'fledge-alpha-free': { limit: { context: 4096 } } });
+    assert.equal(contextWindowFor('fledge-alpha-free (latest)'), 4096);
   });
 });
 

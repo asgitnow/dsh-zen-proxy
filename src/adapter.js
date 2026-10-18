@@ -88,11 +88,12 @@ export function conversationIdentity(options) {
 
 /**
  * 创建一个适配器实例。
- * @param {{state: () => object, clientVersion?: string, apiKey?: string,
+ * @param {{state: () => object, clientVersion?: string, apiKey?: () => Promise<string | undefined>,
  *          regionRelay?: {url: string, token: string}, fetchImpl?: typeof fetch,
  *          attachments?: object, timeoutMs?: number}} deps
  *   `state` 返回最近一次的判定状态（由 `src/state.js` 维护）；
- *   `apiKey` 是已解析的免费车道凭据（见 `src/credentials.js`）；
+ *   `apiKey` 是凭据取值函数（见 `src/credentials.js`）：**每个请求现调一次**，
+ *   换号重登或配置改 key 后立即生效，不持有注册时的旧值；
  *   `regionRelay` 是区域中继（可选）：判定路径为 `relay` 的模型经它收发；
  *   `attachments` 是宿主的 attachment 服务（可选）：图片字节由它按请求尺寸生成。
  * @returns {object} 六点齐全的适配器
@@ -253,6 +254,8 @@ async function* streamTurn(options, { version, apiKey, regionRelay, state, fetch
     };
     return;
   }
+  // 凭据每请求现取：注册后换 key / opencode 重登都在这里反映出来。
+  const bearer = await apiKey?.();
 
   const wire = wireFor(modelId);
   const { session, requestId } = conversationIdentity(options);
@@ -271,7 +274,7 @@ async function* streamTurn(options, { version, apiKey, regionRelay, state, fetch
     temperature: options?.temperature,
     stop: options?.stop,
   });
-  const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey });
+  const headers = buildIdentityHeaders({ version, session, requestId, stream: true, apiKey: bearer });
   // 判定路径为 relay 的模型（区域受限、经中继恢复可用）经同一中继收发。
   const viaRelay = regionRelay !== undefined && viaOf(state(), modelId) === 'relay';
   if (viaRelay) {

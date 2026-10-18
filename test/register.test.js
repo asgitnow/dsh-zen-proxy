@@ -417,6 +417,7 @@ describe('入口 index.js', () => {
     assert.equal(parsed.probeIntervalMinutes, 10);
     assert.equal(parsed.opencodeVersion, '2.0.24');
     assert.equal(parsed.apiKey, '');
+    assert.deepEqual(parsed.capabilities, {});
   });
 });
 

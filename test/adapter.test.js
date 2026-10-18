@@ -298,7 +298,7 @@ describe('prepareCall / stream', () => {
 
   it('发出的请求带齐身份头、四连工具、tool_choice 与原始对话', async () => {
     const { fetch, calls } = fakeFetch(() => sseResponse([chatFrame({ content: 'hi' }), chatFinishFrame('stop')]));
-    const adapter = createAdapter({ state: mixedState, apiKey: 'sk-test', fetchImpl: fetch });
+    const adapter = createAdapter({ state: mixedState, apiKey: async () => 'sk-test', fetchImpl: fetch });
     const prepared = await adapter.prepareCall(ROUTE_MAIN, 'fledge-alpha-free');
     await collect(prepared.stream(options));
 

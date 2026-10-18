@@ -39,9 +39,16 @@ export const Config = z.object({
   opencodeVersion: z.string().default(DEFAULT_CLIENT_VERSION),
   /**
    * 免费车道凭据（闸门已拒绝匿名流量）。留空时按 `OPENCODE_API_KEY` 环境变量 →
-   * opencode 客户端的 `auth.json`（登录过 `opencode auth login` 即有）解析。
+   * opencode 凭据库 `opencode.db`（CLI 里登录过即有，随重登/令牌轮换自动更新）→
+   * 旧版 `auth.json` 解析。每轮与每个请求现读，换 key 不用重启。
    */
   apiKey: z.string().default(''),
+  /**
+   * 能力覆盖（可选）：按模型基名（baseModelId）覆盖/补全能力元数据，字段与
+   * models.dev 条目同形，如 `{"jev-1.13-free": {"limit": {"context": 262144}}}`。
+   * 覆盖侧字段赢，每轮从配置现读，改完下一轮探测生效。
+   */
+  capabilities: z.any().default({}),
   /**
    * 区域中继地址（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md）。
    * 配置后，判定为地区受限的模型改经它探测与对话；中继探测可用即进主目录。
@@ -55,6 +62,7 @@ export const Config = z.object({
  * 挂载插件。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{probeIntervalMinutes: number, opencodeVersion: string, apiKey?: string,
+ *          capabilities?: Record<string, object>,
  *          regionRelayUrl?: string, regionRelayToken?: string}} config
  */
 export function apply(ctx, config) {

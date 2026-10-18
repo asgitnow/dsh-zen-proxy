@@ -15,7 +15,8 @@
  *
  * - 免费判定 = id 以 `-free` 结尾（spec 的「目录只公布免费且可用的模型」定义）；
  * - 协议族判定 = 按 id 决定端点（design D11）；
- * - 上下文窗口 / 输出上限 / 输入模态 = 取自 {@link CAPABILITIES_URL} 并按 id 透传。
+ * - 上下文窗口 / 输出上限 / 输入模态 = 取自 {@link CAPABILITIES_URL} 并按 id 透传，
+ *   插件配置 `capabilities` 里的同形字段按 id 覆盖（{@link setCapabilityOverrides}）。
  *
  * 本模块是**宿主无关的纯逻辑**：不 import 任何 `@deepseek-ai/*` 包。
  *
@@ -216,14 +217,40 @@ export function resetCapabilities() {
   capabilitiesCache = undefined;
 }
 
+/** 用户在插件配置 `capabilities` 里给出的能力覆盖，按 baseModelId 键入，优先于 models.dev。 */
+let overrides = {};
+
 /**
- * 取某个模型在 models.dev 里的条目。
+ * 设置能力覆盖（register 每轮从插件配置读取，改配置下一轮即生效）。
+ *
+ * 字段与 models.dev 条目**同形**：`{ limit: {context, output}, modalities: {input: [...]} }`，
+ * 按 baseModelId 与拉到的条目浅合并（覆盖侧的字段赢）。models.dev 没有的模型
+ * （如 `jev-1.13-free`）可以只给覆盖——这它就有完整元数据了。
+ * 覆盖值不做专门校验：`contextWindowFor`/`outputLimitFor`/`inputModalitiesFor`
+ * 既有的合法值检查就是唯一的闸门，非法值自然被忽略。
+ *
+ * @param {Record<string, {limit?: {context?: number, output?: number}, modalities?: {input?: string[]}}> | undefined} next
+ */
+export function setCapabilityOverrides(next) {
+  overrides = next !== null && typeof next === 'object' ? next : {};
+}
+
+/**
+ * 取某个模型的生效能力条目：models.dev 条目与用户覆盖的合并结果。
  * @param {unknown} modelId
  * @returns {object | undefined}
  */
 export function capabilityOf(modelId) {
   const base = baseModelId(modelId);
-  return capabilitiesCache?.[base];
+  const live = capabilitiesCache?.[base];
+  const ov = overrides[base];
+  if (ov === undefined || typeof ov !== 'object') return live;
+  if (live === undefined || typeof live !== 'object') return ov;
+  return {
+    ...live,
+    limit: { ...live.limit, ...ov.limit },
+    modalities: { ...live.modalities, ...ov.modalities },
+  };
 }
 
 /**

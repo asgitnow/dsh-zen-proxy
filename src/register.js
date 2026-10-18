@@ -21,6 +21,7 @@ import {
   freeCandidates,
   hasTraceableCapabilities,
   loadCapabilities,
+  setCapabilityOverrides,
 } from './catalog.js';
 import { resolveApiKey } from './credentials.js';
 import { FAILURE_CODE, FAILURE_SCOPE } from './failure.js';
@@ -63,7 +64,8 @@ function adoptHostBaseClass(adapter) {
 /**
  * 安装插件。
  * @param {object} ctx cordis 上下文（已 inject `llm`）
- * @param {{probeIntervalMinutes?: number, opencodeVersion?: string, apiKey?: string}} config
+ * @param {{probeIntervalMinutes?: number, opencodeVersion?: string, apiKey?: string,
+ *          capabilities?: Record<string, object>}} config
  * @param {{pluginName?: string, fetchImpl?: typeof fetch, stateFile?: string}} [options] 测试注入点
  * @returns {object} 供测试与诊断使用的接线句柄
  */
@@ -80,14 +82,10 @@ export function register(ctx, config, options = {}) {
   const version = resolvedVersion.version;
 
   // 免费车道闸门已拒绝匿名流量（`Bearer public` 恒 403）：凭据按
-  // 配置 apiKey → OPENCODE_API_KEY → opencode auth.json 的顺序解析，解析一次全程复用。
-  const apiKey = resolveApiKey({ explicit: config?.apiKey });
-  if (apiKey === undefined) {
-    logger.warn?.('zen-proxy: 未找到 OpenCode API key。免费车道现在必须携带真实凭据：'
-      + '登录一次 opencode CLI（`opencode auth login`）后自动读取，'
-      + '或在插件配置 apiKey / 环境变量 OPENCODE_API_KEY 里给出。'
-      + '缺失期间探测会以 403 FreeTierError 失败，模型目录保持为空。');
-  }
+  // 配置 apiKey → OPENCODE_API_KEY → opencode 凭据库（opencode.db）→ 旧版 auth.json
+  // 的顺序解析。**每轮现解析**（在 runRound 里）：opencode 里换号重登或改配置后
+  // 下一轮即生效，无需重启进程。
+  const credentials = () => resolveApiKey({ explicit: config?.apiKey });
 
   // 区域中继（可选）：一个部署在非受限出口的转发 Worker（见 worker/README.md），
   // 让地区受限模型（RegionError）恢复可用。URL 不带尾斜杠；令牌经
@@ -110,12 +108,13 @@ export function register(ctx, config, options = {}) {
   const attachments = typeof ctx?.get === 'function' ? ctx.get('attachments') : undefined;
 
   const adapter = createAdapter({
-    state: () => state, clientVersion: version, apiKey, regionRelay, fetchImpl, attachments,
+    state: () => state, clientVersion: version, apiKey: credentials, regionRelay, fetchImpl, attachments,
   });
   adoptHostBaseClass(adapter);
 
   const controller = new AbortController();
   let roundSeed = 0;
+  let warnedNoKey = false;
 
   function logDiagnostics(diagnostics) {
     for (const entry of diagnostics) {
@@ -130,6 +129,14 @@ export function register(ctx, config, options = {}) {
   async function runRound() {
     roundSeed += 1;
     const round = `round-${roundSeed}`;
+    const apiKey = await credentials();
+    if (apiKey === undefined && !warnedNoKey) {
+      warnedNoKey = true;
+      logger.warn?.('zen-proxy: 未找到 OpenCode 凭据。免费车道现在必须携带真实凭据：'
+        + '在 opencode CLI 登录一次即自动读取（凭据存于 opencode.db，随重登/轮换自动更新），'
+        + '或在插件配置 apiKey / 环境变量 OPENCODE_API_KEY 里给出。'
+        + '缺失期间探测会以 403 FreeTierError 失败，模型目录保持为空。');
+    }
     const session = probeSession();
     const requestId = deriveId('msg_', `listing\0${session}\0${round}`);
     const headers = buildIdentityHeaders({ version, session, requestId, stream: false, apiKey });
@@ -155,6 +162,9 @@ export function register(ctx, config, options = {}) {
       logger.warn?.(`zen-proxy: [${CAPABILITIES_UNAVAILABLE}] 模型能力表拉取失败，`
         + '本轮目录按纯文本声明输入模态');
     }
+    // 配置覆盖每轮从 config 现读：改 cordis.patch.yml 的 capabilities 后下一轮生效。
+    // 覆盖侧字段赢，models.dev 没有的模型（如 jev-1.13-free）可以只靠覆盖拿全元数据。
+    setCapabilityOverrides(config?.capabilities);
 
     const candidates = freeCandidates(listing);
     const withoutMetadata = candidates.filter((id) => !hasTraceableCapabilities(id));
